@@ -1,0 +1,33 @@
+# GPU PyTorch installation (CUDA 12.1)
+--extra-index-url https://download.pytorch.org/whl/cu121
+
+# Core Libraries
+numpy==1.26.4
+pandas==2.2.2
+Pillow==10.3.0
+tqdm==4.66.4
+opencv-python-headless==4.10.0.84
+
+# OCR and Language Detection
+pytesseract==0.3.10
+langdetect==1.0.9
+paddlepaddle==2.6.1
+paddleocr==2.8.1
+
+# PDF Processing
+pdf2image==1.17.0
+
+# Layout Analysis
+scikit-learn==1.5.0
+layoutparser==0.3.4
+
+# PyTorch (GPU - CUDA 12.1 version)
+torch==2.3.1
+torchvision==0.18.1
+torchaudio==2.3.1
+
+# LLM & TrOCR Libraries
+transformers==4.41.2
+accelerate==0.31.0
+bitsandbytes==0.43.1
+sentencepiece==0.2.0

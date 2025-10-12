@@ -1,0 +1,26 @@
+# Docker image ignore list
+
+# Python virtual environment
+venv/
+.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# IDE and OS-specific files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Git and Docker metadata
+.git/
+.gitignore
+.dockerignore
+Dockerfile
+README.md
+
+# Data and output folders (to be mounted as volumes)
+input/
+output/

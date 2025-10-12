@@ -1,0 +1,29 @@
+# Files and folders that will not be tracked by Git
+
+# Python virtual environment
+venv/
+.venv/
+
+# Python cache files
+__pycache__/
+*.pyc
+
+# IDE and operating system specific files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Generated outputs and data
+# These folders should be created locally by each user running the code.
+# They should not be included in version control.
+output/
+
+# Input folder containing sensitive or large data files.
+# IMPORTANT: Not the input folder itself, but its CONTENTS will be ignored.
+# This way, the empty input folder remains in the repo and users
+# know where to place their own files.
+input/*
+output/*
+!input/.gitkeep
+!output/.gitkeep
