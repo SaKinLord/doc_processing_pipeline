@@ -44,8 +44,8 @@ This project requires Docker and NVIDIA GPU support to run.
 
 1.  **Clone the Project:**
     ```bash
-    git clone https://github.com/YOUR_USERNAME/YOUR_REPONAME.git
-    cd YOUR_REPONAME
+    git clone https://github.com/SaKinLord/doc_processing_pipeline.git
+    cd doc_processing_pipeline
     ```
 
 2.  **Build the Docker Image:**
