@@ -44,10 +44,65 @@ NORMALIZERS = {
     "fax": _normalize_phone,
 }
 
+def _calculate_distance(label_bbox, value_bbox, direction):
+    """
+    Calculates the distance between label and value based on direction.
+    Returns (distance, is_valid).
+    """
+    lb_x1, lb_y1, lb_x2, lb_y2 = label_bbox
+    vb_x1, vb_y1, vb_x2, vb_y2 = value_bbox
+    
+    label_y_center = (lb_y1 + lb_y2) / 2
+    value_y_center = (vb_y1 + vb_y2) / 2
+    label_x_center = (lb_x1 + lb_x2) / 2
+    value_x_center = (vb_x1 + vb_x2) / 2
+    
+    v_height = vb_y2 - vb_y1
+    v_width = vb_x2 - vb_x1
+    l_height = lb_y2 - lb_y1
+    l_width = lb_x2 - lb_x1
+    
+    if direction == "right":
+        # Value is to the right of label
+        is_to_right = vb_x1 > lb_x1
+        is_vertically_aligned = (vb_y1 - v_height * 0.5) < label_y_center < (vb_y2 + v_height * 0.5)
+        
+        if is_to_right and is_vertically_aligned:
+            horizontal_gap = vb_x1 - lb_x2
+            if 0 <= horizontal_gap < 350:
+                return horizontal_gap, True
+    
+    elif direction == "below":
+        # Value is below label
+        is_below = vb_y1 > lb_y2
+        # Check horizontal alignment (value should be somewhat aligned horizontally with label)
+        is_horizontally_aligned = (vb_x1 < lb_x2 + l_width * 0.3) and (vb_x2 > lb_x1 - l_width * 0.3)
+        
+        if is_below and is_horizontally_aligned:
+            vertical_gap = vb_y1 - lb_y2
+            if 0 <= vertical_gap < 100:  # Max 100px below
+                return vertical_gap, True
+    
+    elif direction == "right_below":
+        # Value is to the right and slightly below (diagonal)
+        is_to_right = vb_x1 > lb_x1
+        is_slightly_below = 0 <= (vb_y1 - lb_y2) < 50
+        
+        if is_to_right and is_slightly_below:
+            # Calculate Euclidean distance
+            dx = max(0, vb_x1 - lb_x2)
+            dy = max(0, vb_y1 - lb_y2)
+            distance = (dx**2 + dy**2) ** 0.5
+            if distance < 200:
+                return distance, True
+    
+    return float('inf'), False
+
 def find_fields_by_location(text_blocks):
     """
-    Separates text blocks into labels and values, and matches them more intelligently based on location.
-    Priority: The nearest value in the same horizontal band and to the right.
+    ENHANCED: Separates text blocks into labels and values, and matches them intelligently
+    based on location. Searches in multiple directions: right, below, and right-below.
+    Priority: Nearest value in any valid direction.
     """
     labels = []
     values = []
@@ -80,6 +135,7 @@ def find_fields_by_location(text_blocks):
         
         best_candidate = None
         min_dist = float('inf')
+        best_direction = None
 
         for value in values:
             if value["block_index"] in used_value_indices:
@@ -87,28 +143,14 @@ def find_fields_by_location(text_blocks):
             
             vb = value["bounding_box"]
             
-            # --- NEW AND STRICTER CHECKS ---
-            
-            # 1. Vertical Alignment Check: Is the value within the vertical band of the label?
-            # The label's center point should be within the value's y boundaries (with a small tolerance).
-            label_y_center = (lb[1] + lb[3]) / 2
-            value_y_top = vb[1]
-            value_y_bottom = vb[3]
-            v_height = value_y_bottom - value_y_top
-            
-            is_vertically_aligned = (value_y_top - v_height * 0.5) < label_y_center < (value_y_bottom + v_height * 0.5)
-
-            # 2. Horizontal Position Check: Is the value to the right of the label?
-            is_to_the_right = vb[0] > lb[0]
-
-            if is_vertically_aligned and is_to_the_right:
-                # Horizontal gap between the two boxes
-                dist = vb[0] - lb[2]
+            # Try all three directions and pick the closest valid one
+            for direction in ["right", "below", "right_below"]:
+                dist, is_valid = _calculate_distance(lb, vb, direction)
                 
-                # Is it at a reasonable distance? (If too far, it's unrelated)
-                if 0 <= dist < 350 and dist < min_dist:
+                if is_valid and dist < min_dist:
                     min_dist = dist
                     best_candidate = value
+                    best_direction = direction
         
         if best_candidate:
             value_text = best_candidate["content"]
@@ -120,7 +162,8 @@ def find_fields_by_location(text_blocks):
             extracted_fields[key] = {
                 "value": value_text,
                 "label_bbox": lb,
-                "value_bbox": best_candidate["bounding_box"]
+                "value_bbox": best_candidate["bounding_box"],
+                "match_direction": best_direction  # NEW: Track which direction matched
             }
             used_value_indices.add(best_candidate["block_index"])
             

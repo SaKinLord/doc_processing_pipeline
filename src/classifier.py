@@ -1,7 +1,7 @@
 # src/classifier.py
 
 import torch
-import cv2  # ADDED: Import OpenCV library
+import cv2
 from PIL import Image
 from transformers import ViTImageProcessor, ViTForImageClassification
 
@@ -35,20 +35,104 @@ class FigureClassifier:
             self.model = None
 
     def _map_label_to_kind(self, label: str) -> str:
-        """Maps ImageNet labels to simple types needed by our project."""
+        """
+        ENHANCED: Maps ImageNet labels to simple types needed by our project.
+        Now includes many more keywords for better coverage.
+        """
         label = label.lower()
-        if 'bar chart' in label or 'column chart' in label:
+        
+        # Bar charts and column charts
+        if any(keyword in label for keyword in [
+            'bar chart', 'column chart', 'bar graph', 'histogram', 
+            'vertical bar', 'horizontal bar', 'barplot'
+        ]):
             return 'bar_chart'
-        if 'line graph' in label or 'line chart' in label:
+        
+        # Line graphs and line charts
+        if any(keyword in label for keyword in [
+            'line graph', 'line chart', 'time series', 'trend line',
+            'line plot', 'curve', 'timeline'
+        ]):
             return 'line_chart'
-        if 'pie chart' in label:
+        
+        # Pie charts
+        if any(keyword in label for keyword in [
+            'pie chart', 'pie graph', 'donut chart', 'circular chart',
+            'percentage chart'
+        ]):
             return 'pie_chart'
-        if 'map' in label:
+        
+        # Scatter plots
+        if any(keyword in label for keyword in [
+            'scatter plot', 'scatter chart', 'scatterplot', 'point cloud',
+            'dot plot', 'bubble chart'
+        ]):
+            return 'scatter_plot'
+        
+        # Maps and geographic visualizations
+        if any(keyword in label for keyword in [
+            'map', 'atlas', 'globe', 'cartography', 'geographic',
+            'topographic', 'world map', 'street map', 'satellite'
+        ]):
             return 'map'
-        if 'photo' in label or 'photograph' in label or 'digital camera' in label:
+        
+        # Photos and photographs
+        if any(keyword in label for keyword in [
+            'photo', 'photograph', 'picture', 'image', 'snapshot',
+            'digital camera', 'camera', 'portrait', 'landscape photo'
+        ]):
             return 'photo'
-        if 'plot' in label or 'diagram' in label or 'graph' in label:
+        
+        # Flowcharts and diagrams
+        if any(keyword in label for keyword in [
+            'flowchart', 'flow chart', 'workflow', 'process diagram',
+            'decision tree', 'organizational chart', 'org chart',
+            'hierarchy', 'sequence diagram', 'block diagram'
+        ]):
+            return 'flowchart'
+        
+        # Network diagrams
+        if any(keyword in label for keyword in [
+            'network', 'graph network', 'node', 'connection',
+            'circuit', 'wiring', 'topology'
+        ]):
+            return 'network_diagram'
+        
+        # Architecture and blueprints
+        if any(keyword in label for keyword in [
+            'blueprint', 'architecture', 'floor plan', 'schematic',
+            'technical drawing', 'engineering drawing', 'cad'
+        ]):
+            return 'blueprint'
+        
+        # Mathematical plots and functions
+        if any(keyword in label for keyword in [
+            'plot', 'graph', 'function', 'mathematical', 'equation',
+            'coordinate', 'axis', 'cartesian'
+        ]):
             return 'plot'
+        
+        # Tables (sometimes detected as images)
+        if any(keyword in label for keyword in [
+            'table', 'spreadsheet', 'grid', 'matrix', 'data table'
+        ]):
+            return 'table_image'
+        
+        # Diagrams (general)
+        if any(keyword in label for keyword in [
+            'diagram', 'illustration', 'schematic', 'chart',
+            'infographic', 'visualization'
+        ]):
+            return 'diagram'
+        
+        # Scientific visualizations
+        if any(keyword in label for keyword in [
+            'microscope', 'telescope', 'x-ray', 'mri', 'scan',
+            'spectrogram', 'oscilloscope', 'waveform', 'spectrum'
+        ]):
+            return 'scientific_viz'
+        
+        # Default fallback
         return 'figure'
 
     def classify(self, image_roi) -> str:

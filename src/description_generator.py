@@ -40,10 +40,10 @@ class DescriptionGenerator:
             # Load model to GPU in 4-bit
             model = AutoModelForCausalLM.from_pretrained(
                 model_id,
-                device_map="cuda", # Load model directly to GPU
+                device_map="cuda",
                 torch_dtype="auto",
                 trust_remote_code=True,
-                quantization_config=quantization_config # Apply quantization settings
+                quantization_config=quantization_config
             )
             tokenizer = AutoTokenizer.from_pretrained(model_id)
 
@@ -83,24 +83,44 @@ class DescriptionGenerator:
         return "Could not generate a description."
 
     def generate_for_table(self, table_df: pd.DataFrame) -> str:
-        """Generates a one-sentence summary from a pandas DataFrame."""
+        """
+        ENHANCED: Generates a one-sentence summary from a pandas DataFrame.
+        Now provides much more context: shape, column headers, and head/tail samples.
+        """
         if table_df.empty:
             return "The table is empty."
-            
-        # Create a simple text representation of the table to feed the model
-        table_str = table_df.to_string(index=False, max_rows=5)
         
+        num_rows, num_cols = table_df.shape
+        column_names = table_df.columns.tolist()
+        
+        # Get sample data from head and tail
+        head_sample = table_df.head(2).to_string(index=False, max_cols=10)
+        tail_sample = table_df.tail(2).to_string(index=False, max_cols=10) if num_rows > 4 else ""
+        
+        # Build comprehensive context
         prompt = f"""
-You are a data analysis assistant. Based on the following table data, write a single, concise, descriptive sentence summarizing what the table is about. Do not list the data, just describe its purpose.
+You are a data analysis assistant. Based on the following table information, write a single, concise, descriptive sentence summarizing what the table is about. Do not list the data values, just describe the table's purpose and content type.
 
-Table Data:
----
-{table_str}
----
+Table Shape: {num_rows} rows × {num_cols} columns
+Column Headers: {column_names}
 
-One-sentence summary:
+Sample Data (First 2 rows):
+---
+{head_sample}
+---
 """
-        return self._generate_text(prompt, max_length=50)
+        
+        if tail_sample:
+            prompt += f"""
+Sample Data (Last 2 rows):
+---
+{tail_sample}
+---
+"""
+        
+        prompt += "\nOne-sentence summary:"
+        
+        return self._generate_text(prompt, max_length=60)
 
     def generate_for_figure(self, kind: str, caption: str) -> str:
         """Generates a one-sentence description based on a figure's type and caption."""

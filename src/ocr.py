@@ -14,7 +14,7 @@ except ImportError:
     _paddle_ocr_instance = None
     print("Warning: paddleocr not found. Handwriting recognition (Paddle fallback) will be disabled.")
 
-# --- NEW: TrOCR Integration ---
+# --- TrOCR Integration ---
 try:
     from transformers import TrOCRProcessor, VisionEncoderDecoderModel
     _trocr_processor_instance = None
@@ -26,16 +26,44 @@ except ImportError:
 
 
 def _initialize_paddle():
-    """Initializes PaddleOCR only when first called."""
+    """Initializes PaddleOCR only when first called. Checks ModelManager first."""
     global _paddle_ocr_instance
+    
+    if _paddle_ocr_instance is not None:
+        return
+    
+    # Try to get from ModelManager first
+    try:
+        from .model_manager import ModelManager
+        _paddle_ocr_instance = ModelManager.get_paddle_ocr()
+        if _paddle_ocr_instance is not None:
+            return
+    except:
+        pass
+    
+    # Fall back to on-demand initialization
     if _paddle_ocr_instance is None and 'paddleocr' in globals():
         print("    - Initializing PaddleOCR for the first time...")
         _paddle_ocr_instance = PaddleOCR(use_angle_cls=True, lang='latin', show_log=False)
         print("    - PaddleOCR initialized.")
 
 def _initialize_trocr():
-    """Initializes TrOCR model and processor only when first called."""
+    """Initializes TrOCR model and processor only when first called. Checks ModelManager first."""
     global _trocr_processor_instance, _trocr_model_instance
+    
+    if _trocr_processor_instance is not None:
+        return
+    
+    # Try to get from ModelManager first
+    try:
+        from .model_manager import ModelManager
+        _trocr_processor_instance, _trocr_model_instance = ModelManager.get_trocr()
+        if _trocr_processor_instance is not None:
+            return
+    except:
+        pass
+    
+    # Fall back to on-demand initialization
     if _trocr_processor_instance is None and 'TrOCRProcessor' in globals() and torch.cuda.is_available():
         try:
             print("    - Initializing TrOCR model for handwriting (this may take a moment)...")
@@ -45,7 +73,7 @@ def _initialize_trocr():
             print("    - ✅ TrOCR model initialized successfully on GPU.")
         except Exception as e:
             print(f"    - [ERROR] Failed to initialize TrOCR model: {e}")
-            _trocr_processor_instance = None # Set to None to avoid retrying on failure
+            _trocr_processor_instance = None
             _trocr_model_instance = None
 
 
@@ -97,7 +125,6 @@ def ocr_with_paddle(roi_bgr):
         print(f"    - Error during PaddleOCR: {e}")
         return ""
 
-# NEW FUNCTION
 def ocr_with_trocr(roi_bgr):
     """Runs TrOCR model on the given ROI."""
     _initialize_trocr()
@@ -114,7 +141,6 @@ def ocr_with_trocr(roi_bgr):
         print(f"    - Error during TrOCR inference: {e}")
         return ""
 
-# UPDATED FUNCTION: 3-Stage Smart OCR
 def ocr_smart(original_bgr_image, binary_image, box, lang=DEFAULT_OCR_LANG):
     """
     Applies 3-stage smart OCR: Tesseract -> PaddleOCR -> TrOCR.
@@ -146,10 +172,9 @@ def ocr_smart(original_bgr_image, binary_image, box, lang=DEFAULT_OCR_LANG):
         if len(paddle_text) > len(best_text) + 3:
             print(f"    - PaddleOCR provided a better result. Using it for now.")
             best_text = paddle_text
-            best_conf = max(tess_conf, 75.0) # Update confidence score
+            best_conf = max(tess_conf, 75.0)
 
     # --- Stage 3: TrOCR Fallback (handwriting expert) ---
-    # If the previous best result is still weak and TrOCR is available
     if (best_conf < LOW_CONFIDENCE_THRESHOLD or len(best_text) < 5) and 'TrOCRProcessor' in globals():
         print(f"    - Previous results still weak. Triggering TrOCR expert...")
         trocr_text = ocr_with_trocr(roi_original)
@@ -157,6 +182,6 @@ def ocr_smart(original_bgr_image, binary_image, box, lang=DEFAULT_OCR_LANG):
         if len(trocr_text) > len(best_text) + 3:
             print(f"    - ✅ TrOCR provided the best result!")
             best_text = trocr_text
-            best_conf = 90.0 # Assign a high confidence score when TrOCR succeeds
+            best_conf = 90.0
             
     return best_text, best_conf

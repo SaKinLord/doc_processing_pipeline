@@ -16,13 +16,10 @@ from . import (
     field_extraction
 )
 
-from .description_generator import DescriptionGenerator
-
 class DocumentProcessor:
     """
     End-to-end pipeline class for processing a single document page.
     """
-    _description_generator = None
     
     def __init__(self, file_path=None, image_object=None, file_name=None, page_num=1, language_override=None):
         if file_path:
@@ -37,7 +34,7 @@ class DocumentProcessor:
             raise ValueError("DocumentProcessor requires either a file_path or an image_object with a file_name.")
 
         self.page_num = page_num
-        self.language_override = language_override # UPDATED
+        self.language_override = language_override
         
         # Data to be generated during processing
         self.bgr_image = None
@@ -54,6 +51,20 @@ class DocumentProcessor:
         self.elements = []
         self.metadata = {}
 
+    def _get_description_generator(self):
+        """Gets the description generator from ModelManager or creates one."""
+        try:
+            from .model_manager import ModelManager
+            desc_gen = ModelManager.get_description_generator()
+            if desc_gen is not None and desc_gen.pipe is not None:
+                return desc_gen
+        except:
+            pass
+        
+        # Fall back to creating a new instance
+        from .description_generator import DescriptionGenerator
+        return DescriptionGenerator()
+
     def _prepare_image(self):
         """Loads the image and applies preprocessing steps."""
         print(f"  [1/8] Preparing image for page {self.page_num}...")
@@ -66,7 +77,6 @@ class DocumentProcessor:
             raise ValueError("Image could not be loaded.")
             
         self.height, self.width, _ = self.bgr_image.shape
-        # UPDATED: Store binarized image within the class
         self.binary_image = image_utils.preprocess_for_ocr(self.bgr_image)
         self.binarized_inv = 255 - self.binary_image
 
@@ -80,7 +90,6 @@ class DocumentProcessor:
         """Detects the document's language with a quick OCR scan."""
         print(f"  [3/8] Detecting language...")
         
-        # UPDATED: If language is provided externally, skip detection.
         if self.language_override:
             self.detected_lang_tess = self.language_override
             lang_code_map_rev = {'eng': 'en', 'tur': 'tr', 'deu': 'de', 'fra': 'fr', 'spa': 'es'}
@@ -96,7 +105,6 @@ class DocumentProcessor:
                 self.metadata['language'] = config.DEFAULT_OCR_LANG.split('+')[0]
                 return
 
-            # UPDATED: Use detect_langs to get probabilities
             detected_langs = detect_langs(initial_text)
             if not detected_langs:
                 raise LangDetectException("No language detected")
@@ -107,13 +115,12 @@ class DocumentProcessor:
             
             print(f"    - Candidate language: '{lang_code}' with confidence {lang_prob:.2f}")
 
-            # Confidence threshold check
             if lang_prob < config.LANG_DETECT_CONFIDENCE_THRESHOLD:
                 print(f"    - Confidence below threshold ({config.LANG_DETECT_CONFIDENCE_THRESHOLD}). Using default language.")
                 self.metadata['language'] = config.DEFAULT_OCR_LANG.split('+')[0]
                 return
 
-            LANG_MAP = {'en': 'eng', 'tr': 'tur', 'de': 'deu', 'fr': 'fra', 'es': 'spa', 'id': 'ind'} # 'id' added
+            LANG_MAP = {'en': 'eng', 'tr': 'tur', 'de': 'deu', 'fr': 'fra', 'es': 'spa', 'id': 'ind'}
             self.detected_lang_tess = LANG_MAP.get(lang_code, 'eng')
             self.metadata['language'] = lang_code
             print(f"    - Language confirmed: '{lang_code}' -> Using Tesseract lang: '{self.detected_lang_tess}'")
@@ -131,24 +138,54 @@ class DocumentProcessor:
         
         temp_elements = []
         for i, block_data in enumerate(detected_elements):
-            text = block_data['content']
-            box = block_data['bounding_box']
+            # Check if this is from layoutparser (has 'layout_type') or tesseract
+            if 'layout_type' in block_data:
+                # From layoutparser - may not have content yet
+                element_type = block_data.get('type', 'TextBlock')
+                box = block_data['bounding_box']
+                
+                # Only perform OCR on TextBlocks
+                if element_type == 'TextBlock':
+                    text, conf = ocr.ocr_smart(
+                        original_bgr_image=self.bgr_image,
+                        binary_image=self.binary_image,
+                        box=box,
+                        lang=self.detected_lang_tess
+                    )
+                    temp_elements.append({
+                        "id": f"textblock_{i+1}",
+                        "type": "TextBlock",
+                        "bounding_box": box,
+                        "content": text,
+                        "meta": {"ocr_conf": round(conf, 2), "confidence": block_data.get('confidence', 0)}
+                    })
+                else:
+                    # For Table and Figure elements from layoutparser, just record them
+                    temp_elements.append({
+                        "id": f"{element_type.lower()}_{i+1}",
+                        "type": element_type,
+                        "bounding_box": box,
+                        "meta": {"confidence": block_data.get('confidence', 0)}
+                    })
+            else:
+                # From tesseract - already has content
+                text = block_data.get('content', '')
+                box = block_data['bounding_box']
+                
+                text, conf = ocr.ocr_smart(
+                    original_bgr_image=self.bgr_image,
+                    binary_image=self.binary_image,
+                    box=box,
+                    lang=self.detected_lang_tess
+                )
 
-            # UPDATED: Provide both original and binarized images to ocr_smart
-            text, conf = ocr.ocr_smart(
-                original_bgr_image=self.bgr_image,
-                binary_image=self.binary_image,
-                box=box,
-                lang=self.detected_lang_tess
-            )
-
-            temp_elements.append({
-                "id": f"textblock_{i+1}",
-                "type": "TextBlock",
-                "bounding_box": box,
-                "content": text,
-                "meta": {"ocr_conf": round(conf, 2)}
-            })
+                temp_elements.append({
+                    "id": f"textblock_{i+1}",
+                    "type": "TextBlock",
+                    "bounding_box": box,
+                    "content": text,
+                    "meta": {"ocr_conf": round(conf, 2)}
+                })
         
         self.elements.extend(layout_detection.reorder_blocks_by_columns(temp_elements))
 
@@ -235,17 +272,15 @@ class DocumentProcessor:
             
         tables_in_elements = [el for el in self.elements if el['type'] == 'Table']
         if tables_in_elements:
-            # Initialize generator only when needed and only once
-            if DocumentProcessor._description_generator is None:
-                DocumentProcessor._description_generator = DescriptionGenerator()
+            description_generator = self._get_description_generator()
             
-            if DocumentProcessor._description_generator.pipe:
+            if description_generator and description_generator.pipe:
                 print("    - Generating natural language descriptions for tables...")
                 for table_element in tables_in_elements:
                     csv_path = table_element.get("export", {}).get("csv_path")
                     if csv_path and os.path.exists(csv_path):
                         df = pd.read_csv(csv_path)
-                        description = DocumentProcessor._description_generator.generate_for_table(df)
+                        description = description_generator.generate_for_table(df)
                         table_element['description'] = description    
 
     def _extract_figures(self):
@@ -308,16 +343,14 @@ class DocumentProcessor:
 
         figures_in_elements = [el for el in self.elements if el['type'] == 'Figure']
         if figures_in_elements:
-            # Initialize generator only when needed and only once
-            if DocumentProcessor._description_generator is None:
-                DocumentProcessor._description_generator = DescriptionGenerator()
+            description_generator = self._get_description_generator()
 
-            if DocumentProcessor._description_generator.pipe:
+            if description_generator and description_generator.pipe:
                 print("    - Generating natural language descriptions for figures...")
                 for fig_element in figures_in_elements:
                     kind = fig_element.get("kind", "figure")
                     caption = fig_element.get("caption", "")
-                    description = DocumentProcessor._description_generator.generate_for_figure(kind, caption)
+                    description = description_generator.generate_for_figure(kind, caption)
                     fig_element['description'] = description
 
     def _extract_fields(self):

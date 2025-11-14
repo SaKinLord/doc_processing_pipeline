@@ -18,8 +18,9 @@ Thumbs.db
 .git/
 .gitignore
 .dockerignore
-Dockerfile
 README.md
+IMPROVEMENTS.md
+QUICKSTART.md
 
 # Data and output folders (to be mounted as volumes)
 input/

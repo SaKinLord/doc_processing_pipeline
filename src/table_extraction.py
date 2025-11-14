@@ -6,8 +6,25 @@ import pandas as pd
 from . import utils
 
 def find_lines(binarized_image_inv, min_len=80, gap=10, threshold=120):
-    """Finds horizontal and vertical lines in the image using Hough Transform."""
-    edges = cv2.Canny(255 - binarized_image_inv, 50, 150, apertureSize=3)
+    """
+    ENHANCED: Finds horizontal and vertical lines in the image using Hough Transform.
+    Now applies morphological operations to connect broken/faint lines first.
+    """
+    # NEW: Apply morphological operations to connect broken lines
+    # This makes faint, dashed, or broken lines more solid and easier to detect
+    
+    # Connect horizontal lines
+    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 1))
+    enhanced_horizontal = cv2.dilate(binarized_image_inv, horizontal_kernel, iterations=1)
+    
+    # Connect vertical lines
+    vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 5))
+    enhanced_vertical = cv2.dilate(binarized_image_inv, vertical_kernel, iterations=1)
+    
+    # Combine both enhancements
+    enhanced_image = cv2.bitwise_or(enhanced_horizontal, enhanced_vertical)
+    
+    edges = cv2.Canny(255 - enhanced_image, 50, 150, apertureSize=3)
     lines = cv2.HoughLinesP(
         edges, 1, np.pi / 180, threshold=threshold, minLineLength=min_len, maxLineGap=gap
     )
