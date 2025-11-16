@@ -24,6 +24,14 @@ except ImportError:
     _trocr_model_instance = None
     print("Warning: sentencepiece or other transformers dependencies not found. TrOCR fallback will be disabled.")
 
+# --- Handwriting Detector Integration ---
+try:
+    from .handwriting_detector import get_handwriting_detector
+    _handwriting_detector_available = True
+except ImportError:
+    _handwriting_detector_available = False
+    print("Warning: handwriting_detector module not available. Smart OCR routing will use heuristics only.")
+
 
 def _initialize_paddle():
     """Initializes PaddleOCR only when first called. Checks ModelManager first."""
@@ -83,14 +91,213 @@ def _clean_text(text):
         return ""
     return re.sub(r'\s+', ' ', text).strip()
 
+
+def _calculate_text_quality_score(text, confidence=0.0):
+    """
+    Calculates a quality score for OCR text based on multiple heuristics.
+
+    Returns a score from 0-100 where higher is better.
+    """
+    if not text or not isinstance(text, str):
+        return 0.0
+
+    text = text.strip()
+    if len(text) == 0:
+        return 0.0
+
+    score = 0.0
+
+    # 1. Confidence contribution (0-30 points)
+    score += min(30.0, confidence * 0.3)
+
+    # 2. Length contribution (0-15 points)
+    # Reward longer text but cap at reasonable length
+    length_score = min(15.0, len(text) / 10.0)
+    score += length_score
+
+    # 3. Fragmentation penalty (0-25 points)
+    # High fragmentation (many short words) indicates OCR failure
+    words = text.split()
+    if len(words) > 0:
+        avg_word_length = len(text.replace(' ', '')) / len(words)
+        if avg_word_length >= 4.0:
+            score += 25.0  # Good average word length
+        elif avg_word_length >= 3.0:
+            score += 15.0
+        elif avg_word_length >= 2.0:
+            score += 5.0
+        # else: highly fragmented, no points
+
+    # 4. Character composition (0-20 points)
+    # Good text should have mostly alphanumeric characters
+    if len(text) > 0:
+        alnum_count = sum(1 for c in text if c.isalnum() or c.isspace())
+        alnum_ratio = alnum_count / len(text)
+        score += alnum_ratio * 20.0
+
+    # 5. Noise patterns penalty (0-10 points)
+    # Penalize common OCR failure patterns
+    noise_penalty = 0.0
+
+    # Single character repetitions (like "l l l l")
+    single_char_pattern = re.findall(r'\b\w\b', text)
+    if len(single_char_pattern) > 3:
+        noise_penalty += min(5.0, len(single_char_pattern) * 0.5)
+
+    # Excessive punctuation
+    punct_count = sum(1 for c in text if c in '.,;:!?-_/\\|@#$%^&*()[]{}')
+    if len(text) > 0 and punct_count / len(text) > 0.3:
+        noise_penalty += 3.0
+
+    # Very short words dominating
+    if len(words) > 3:
+        short_words = sum(1 for w in words if len(w) <= 2)
+        if short_words / len(words) > 0.6:
+            noise_penalty += 2.0
+
+    score = max(0.0, score - noise_penalty)
+
+    return min(100.0, score)
+
+
+def _is_likely_handwritten(text, confidence):
+    """
+    Heuristic to determine if text is likely handwritten based on OCR results.
+
+    Returns True if text appears to be handwritten (OCR struggled with it).
+    """
+    if not text or len(text.strip()) == 0:
+        return False
+
+    # High fragmentation with low confidence suggests handwriting
+    words = text.split()
+    if len(words) == 0:
+        return False
+
+    avg_word_length = len(text.replace(' ', '')) / len(words)
+
+    # Highly fragmented with low confidence
+    if avg_word_length < 3.0 and confidence < 60.0:
+        return True
+
+    # Many single-character "words"
+    single_chars = sum(1 for w in words if len(w) == 1)
+    if len(words) > 2 and single_chars / len(words) > 0.4:
+        return True
+
+    return False
+
+
 def _get_psm_for_box(box):
     """Selects the most appropriate Tesseract PSM mode based on the box's aspect ratio."""
     x1, y1, x2, y2 = map(float, box)
     w, h = max(1.0, x2 - x1), max(1.0, y2 - y1)
     aspect_ratio = w / h
-    if aspect_ratio > 5.0: return 7
-    if w * h < 8000: return 13
+    if aspect_ratio > 5.0:
+        return 7
+    if w * h < 8000:
+        return 13
     return 6
+
+
+def _detect_text_type(roi_image):
+    """
+    Uses the handwriting detector to classify text as printed or handwritten.
+
+    Args:
+        roi_image: Input image (BGR or grayscale)
+
+    Returns:
+        tuple: (text_type, confidence) where text_type is 'printed' or 'handwritten'
+    """
+    if not _handwriting_detector_available:
+        return 'unknown', 0.0
+
+    try:
+        detector = get_handwriting_detector()
+        result = detector.classify(roi_image)
+        return result['classification'], result['confidence']
+    except Exception as e:
+        print(f"    - Handwriting detection failed: {e}")
+        return 'unknown', 0.0
+
+
+def ocr_routed(original_bgr_image, binary_image, box, lang=DEFAULT_OCR_LANG):
+    """
+    Routes OCR to the most appropriate engine based on text type detection.
+
+    This is more efficient than the fallback chain approach as it:
+    1. Pre-classifies text as printed or handwritten
+    2. Routes directly to the best OCR engine
+    3. Skips unnecessary OCR stages
+
+    Args:
+        original_bgr_image: Original BGR image
+        binary_image: Binary (preprocessed) image
+        box: Bounding box [x1, y1, x2, y2]
+        lang: Language code for Tesseract
+
+    Returns:
+        tuple: (text, confidence)
+    """
+    x1, y1, x2, y2 = map(int, box)
+    roi_binary = binary_image[y1:y2, x1:x2]
+    roi_original = original_bgr_image[y1:y2, x1:x2]
+
+    if roi_binary.size == 0 or roi_original.size == 0:
+        return "", 0.0
+
+    # Step 1: Detect text type using handwriting detector
+    text_type, detection_confidence = _detect_text_type(roi_original)
+
+    # Step 2: Route to appropriate OCR engine
+    if text_type == 'handwritten' and detection_confidence > 0.7:
+        # High confidence handwritten text -> Use TrOCR directly
+        print(f"    - Text classified as HANDWRITTEN (conf: {detection_confidence:.2f}). Routing to TrOCR...")
+
+        if 'TrOCRProcessor' in globals():
+            trocr_text = ocr_with_trocr(roi_original)
+            if trocr_text and len(trocr_text.strip()) > 0:
+                quality = _calculate_text_quality_score(trocr_text, 85.0)
+                if quality > 40.0:
+                    print(f"    - TrOCR result: '{trocr_text[:50]}...' (quality: {quality:.1f})")
+                    return trocr_text, 85.0
+
+        # Fallback to PaddleOCR if TrOCR fails
+        if 'paddleocr' in globals():
+            paddle_text = ocr_with_paddle(roi_original)
+            if paddle_text and len(paddle_text.strip()) > 0:
+                return paddle_text, 75.0
+
+        # Last resort: Tesseract
+        return ocr_with_tesseract(roi_binary, lang=lang, box=box)
+
+    elif text_type == 'printed' and detection_confidence > 0.7:
+        # High confidence printed text -> Use Tesseract directly
+        print(f"    - Text classified as PRINTED (conf: {detection_confidence:.2f}). Routing to Tesseract...")
+
+        tess_text, tess_conf = ocr_with_tesseract(roi_binary, lang=lang, box=box)
+        quality = _calculate_text_quality_score(tess_text, tess_conf)
+
+        if quality > 60.0:
+            return tess_text, tess_conf
+
+        # If Tesseract quality is poor, try PaddleOCR as backup
+        if quality < 50.0 and 'paddleocr' in globals():
+            print(f"    - Tesseract quality low ({quality:.1f}). Trying PaddleOCR...")
+            paddle_text = ocr_with_paddle(roi_original)
+            if paddle_text:
+                paddle_quality = _calculate_text_quality_score(paddle_text, 75.0)
+                if paddle_quality > quality:
+                    return paddle_text, 75.0
+
+        return tess_text, tess_conf
+
+    else:
+        # Uncertain classification -> Fall back to smart OCR (original behavior)
+        print(f"    - Text type uncertain (type: {text_type}, conf: {detection_confidence:.2f}). Using smart OCR...")
+        return ocr_smart(original_bgr_image, binary_image, box, lang)
+
 
 def ocr_with_tesseract(roi_bgr, lang=DEFAULT_OCR_LANG, psm=None, box=None):
     """Runs Tesseract OCR on the given ROI."""
@@ -144,44 +351,73 @@ def ocr_with_trocr(roi_bgr):
 def ocr_smart(original_bgr_image, binary_image, box, lang=DEFAULT_OCR_LANG):
     """
     Applies 3-stage smart OCR: Tesseract -> PaddleOCR -> TrOCR.
-    Each stage activates when the previous one fails.
+    Uses quality scoring and fragmentation heuristics to determine best result.
     """
     x1, y1, x2, y2 = map(int, box)
     roi_binary = binary_image[y1:y2, x1:x2]
-    if roi_binary.size == 0: return "", 0.0
+    if roi_binary.size == 0:
+        return "", 0.0
 
     # --- Stage 1: Tesseract (optimized for printed text) ---
     tess_text, tess_conf = ocr_with_tesseract(roi_binary, lang=lang, box=box)
-    
-    # If Tesseract result is good enough, no need to continue.
-    if tess_conf > 85.0 and len(tess_text) > 3:
+    tess_quality = _calculate_text_quality_score(tess_text, tess_conf)
+
+    # Check if Tesseract result is excellent
+    if tess_quality > 80.0 and tess_conf > 85.0:
         return tess_text, tess_conf
 
-    # Variables to store the result
+    # Variables to store the best result
     best_text = tess_text
     best_conf = tess_conf
+    best_quality = tess_quality
 
     roi_original = original_bgr_image[y1:y2, x1:x2]
-    if roi_original.size == 0: return best_text, best_conf
+    if roi_original.size == 0:
+        return best_text, best_conf
+
+    # Check if we should try alternative OCR engines
+    is_fragmented = _is_likely_handwritten(tess_text, tess_conf)
+    should_try_alternatives = (
+        tess_conf < LOW_CONFIDENCE_THRESHOLD or
+        tess_quality < 60.0 or
+        is_fragmented or
+        len(tess_text.strip()) < 3
+    )
 
     # --- Stage 2: PaddleOCR Fallback (general purpose and handwriting) ---
-    if (tess_conf < LOW_CONFIDENCE_THRESHOLD or len(tess_text) < 5) and 'paddleocr' in globals():
-        print(f"    - Tesseract low ({tess_conf:.2f}%). Trying PaddleOCR...")
+    if should_try_alternatives and 'paddleocr' in globals():
+        reason = "fragmented" if is_fragmented else f"low quality ({tess_quality:.1f})"
+        print(f"    - Tesseract result {reason}. Trying PaddleOCR...")
         paddle_text = ocr_with_paddle(roi_original)
-        
-        if len(paddle_text) > len(best_text) + 3:
-            print(f"    - PaddleOCR provided a better result. Using it for now.")
-            best_text = paddle_text
-            best_conf = max(tess_conf, 75.0)
+
+        if paddle_text:
+            paddle_quality = _calculate_text_quality_score(paddle_text, 75.0)
+
+            if paddle_quality > best_quality:
+                print(f"    - PaddleOCR better (quality: {paddle_quality:.1f} vs {best_quality:.1f})")
+                best_text = paddle_text
+                best_conf = 75.0
+                best_quality = paddle_quality
 
     # --- Stage 3: TrOCR Fallback (handwriting expert) ---
-    if (best_conf < LOW_CONFIDENCE_THRESHOLD or len(best_text) < 5) and 'TrOCRProcessor' in globals():
-        print(f"    - Previous results still weak. Triggering TrOCR expert...")
+    # Only use TrOCR if text appears handwritten or quality is still poor
+    is_still_fragmented = _is_likely_handwritten(best_text, best_conf)
+    should_try_trocr = (
+        (best_quality < 50.0 or is_still_fragmented) and
+        'TrOCRProcessor' in globals()
+    )
+
+    if should_try_trocr:
+        print(f"    - Result still weak or appears handwritten. Trying TrOCR expert...")
         trocr_text = ocr_with_trocr(roi_original)
 
-        if len(trocr_text) > len(best_text) + 3:
-            print(f"    - ✅ TrOCR provided the best result!")
-            best_text = trocr_text
-            best_conf = 90.0
-            
+        if trocr_text:
+            trocr_quality = _calculate_text_quality_score(trocr_text, 85.0)
+
+            if trocr_quality > best_quality:
+                print(f"    - TrOCR better (quality: {trocr_quality:.1f} vs {best_quality:.1f})")
+                best_text = trocr_text
+                best_conf = 85.0
+                best_quality = trocr_quality
+
     return best_text, best_conf

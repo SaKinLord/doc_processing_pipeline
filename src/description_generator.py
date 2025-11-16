@@ -126,7 +126,7 @@ Sample Data (Last 2 rows):
         """Generates a one-sentence description based on a figure's type and caption."""
         if not caption and not kind:
             return "No information available to describe the figure."
-            
+
         prompt = f"""
 You are a document analysis assistant. Based on the following information, write a one-sentence natural language description for the figure.
 
@@ -136,3 +136,96 @@ You are a document analysis assistant. Based on the following information, write
 One-sentence description:
 """
         return self._generate_text(prompt, max_length=50)
+
+    def extract_fields_from_text(self, text_blocks_summary: str, target_fields: list = None) -> dict:
+        """
+        Uses LLM to extract key-value fields from document text.
+
+        Args:
+            text_blocks_summary: String containing all text blocks from the document
+            target_fields: List of field names to extract (e.g., ['date', 'to', 'from', 'subject'])
+                          If None, extracts common form fields.
+
+        Returns:
+            Dictionary of extracted fields with their values.
+        """
+        if not self.pipe:
+            return {}
+
+        if target_fields is None:
+            target_fields = ['date', 'to', 'from', 'subject', 'fax', 'phone', 'pages']
+
+        fields_str = ', '.join(target_fields)
+
+        prompt = f"""You are a document field extraction assistant. Extract the following fields from the document text below: {fields_str}
+
+Document text:
+---
+{text_blocks_summary}
+---
+
+Instructions:
+- Extract ONLY the values for the requested fields
+- If a field is not found, omit it from the response
+- Return the result as a simple key: value format, one per line
+- Do not include any explanation or additional text
+- For dates, use the format found in the document
+- For phone/fax numbers, include all digits
+
+Example format:
+date: 2024-01-15
+to: John Smith
+from: ACME Corp
+subject: Monthly Report
+
+Extracted fields:"""
+
+        try:
+            result_text = self._generate_text(prompt, max_length=200)
+
+            # Parse the generated text into a dictionary
+            extracted = {}
+            for line in result_text.strip().split('\n'):
+                line = line.strip()
+                if ':' in line and not line.startswith('#'):
+                    # Split only on first colon
+                    parts = line.split(':', 1)
+                    if len(parts) == 2:
+                        key = parts[0].strip().lower()
+                        value = parts[1].strip()
+                        # Only include if it's a requested field
+                        if key in [f.lower() for f in target_fields] and value:
+                            extracted[key] = value
+
+            return extracted
+        except Exception as e:
+            print(f"    - Error during LLM field extraction: {e}")
+            return {}
+
+    def extract_fields_structured(self, text_blocks: list, target_fields: list = None) -> dict:
+        """
+        Enhanced field extraction using structured text block information.
+
+        Args:
+            text_blocks: List of text block dictionaries with 'content' and 'bounding_box'
+            target_fields: List of field names to extract
+
+        Returns:
+            Dictionary of extracted fields.
+        """
+        if not self.pipe:
+            return {}
+
+        if target_fields is None:
+            target_fields = ['date', 'to', 'from', 'subject', 'fax', 'phone', 'pages']
+
+        # Create a structured summary of text blocks
+        block_summaries = []
+        for i, block in enumerate(text_blocks[:50]):  # Limit to first 50 blocks
+            content = block.get('content', '').strip()
+            if content:
+                block_summaries.append(f"[Block {i+1}] {content}")
+
+        text_summary = '\n'.join(block_summaries)
+
+        return self.extract_fields_from_text(text_summary, target_fields)

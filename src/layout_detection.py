@@ -172,5 +172,174 @@ def reorder_blocks_by_columns(blocks, col_tolerance=80):
 
     for block in sorted_blocks:
         del block['_col_idx']
-        
+
     return sorted_blocks
+
+
+def reorder_blocks_by_graph(blocks, vertical_threshold=20, horizontal_overlap_ratio=0.3):
+    """
+    Reorders text blocks using graph-based topological sorting.
+
+    This handles complex layouts better than simple column-based sorting:
+    - Magazine-style layouts with multiple columns
+    - Headers that span multiple columns
+    - Irregular text flow patterns
+
+    Args:
+        blocks: List of block dictionaries with 'bounding_box'
+        vertical_threshold: Max vertical gap for "same line" detection
+        horizontal_overlap_ratio: Min overlap ratio for "same column"
+
+    Returns:
+        List of blocks in reading order
+    """
+    if not blocks or len(blocks) <= 1:
+        return blocks
+
+    n = len(blocks)
+
+    # Build directed graph: edge (i, j) means block i should be read before block j
+    # Using adjacency list representation
+    graph = {i: [] for i in range(n)}
+    in_degree = {i: 0 for i in range(n)}
+
+    # Helper to check horizontal overlap
+    def get_horizontal_overlap(box1, box2):
+        """Returns overlap ratio of horizontal ranges."""
+        x1_min, _, x1_max, _ = box1
+        x2_min, _, x2_max, _ = box2
+
+        overlap_start = max(x1_min, x2_min)
+        overlap_end = min(x1_max, x2_max)
+
+        if overlap_end <= overlap_start:
+            return 0.0
+
+        overlap_width = overlap_end - overlap_start
+        min_width = min(x1_max - x1_min, x2_max - x2_min)
+
+        if min_width <= 0:
+            return 0.0
+
+        return overlap_width / min_width
+
+    def get_vertical_overlap(box1, box2):
+        """Returns overlap ratio of vertical ranges."""
+        _, y1_min, _, y1_max = box1
+        _, y2_min, _, y2_max = box2
+
+        overlap_start = max(y1_min, y2_min)
+        overlap_end = min(y1_max, y2_max)
+
+        if overlap_end <= overlap_start:
+            return 0.0
+
+        overlap_height = overlap_end - overlap_start
+        min_height = min(y1_max - y1_min, y2_max - y2_min)
+
+        if min_height <= 0:
+            return 0.0
+
+        return overlap_height / min_height
+
+    # Build edges based on spatial relationships
+    for i in range(n):
+        box_i = blocks[i]['bounding_box']
+        _, y1_i, _, y2_i = box_i
+        center_y_i = (y1_i + y2_i) / 2
+
+        for j in range(n):
+            if i == j:
+                continue
+
+            box_j = blocks[j]['bounding_box']
+            _, y1_j, _, y2_j = box_j
+            center_y_j = (y1_j + y2_j) / 2
+
+            # Rule 1: Block i is above block j (vertical relationship)
+            # If blocks have horizontal overlap and i is above j
+            h_overlap = get_horizontal_overlap(box_i, box_j)
+
+            if h_overlap > horizontal_overlap_ratio:
+                # Same column - vertical ordering matters
+                if y2_i < y1_j - vertical_threshold:
+                    # i is clearly above j
+                    graph[i].append(j)
+                    in_degree[j] += 1
+
+            # Rule 2: Same line detection (horizontal relationship)
+            # If blocks are on the same line, left-to-right ordering
+            v_overlap = get_vertical_overlap(box_i, box_j)
+
+            if v_overlap > 0.5:  # Significant vertical overlap = same line
+                x1_i = box_i[0]
+                x1_j = box_j[0]
+
+                if x1_i < x1_j and h_overlap < 0.1:  # i is to the left of j
+                    # Check if no block is between them
+                    graph[i].append(j)
+                    in_degree[j] += 1
+
+    # Topological sort using Kahn's algorithm
+    queue = []
+    for i in range(n):
+        if in_degree[i] == 0:
+            queue.append(i)
+
+    # Sort initial queue by position (top-left first)
+    queue.sort(key=lambda idx: (blocks[idx]['bounding_box'][1], blocks[idx]['bounding_box'][0]))
+
+    sorted_indices = []
+    while queue:
+        # Pick the block that appears first spatially among available blocks
+        queue.sort(key=lambda idx: (blocks[idx]['bounding_box'][1], blocks[idx]['bounding_box'][0]))
+        current = queue.pop(0)
+        sorted_indices.append(current)
+
+        # Remove edges from current
+        for neighbor in graph[current]:
+            in_degree[neighbor] -= 1
+            if in_degree[neighbor] == 0:
+                queue.append(neighbor)
+
+    # Check for cycles (shouldn't happen with proper document layout)
+    if len(sorted_indices) != n:
+        # Fallback: add remaining blocks sorted by position
+        remaining = set(range(n)) - set(sorted_indices)
+        remaining_sorted = sorted(remaining, key=lambda idx: (
+            blocks[idx]['bounding_box'][1],
+            blocks[idx]['bounding_box'][0]
+        ))
+        sorted_indices.extend(remaining_sorted)
+
+    # Return blocks in sorted order
+    return [blocks[i] for i in sorted_indices]
+
+
+def reorder_blocks_smart(blocks, use_graph=True, col_tolerance=80):
+    """
+    Smart block reordering that chooses the best algorithm.
+
+    Args:
+        blocks: List of block dictionaries
+        use_graph: If True, uses graph-based sorting; otherwise column-based
+        col_tolerance: Tolerance for column-based clustering
+
+    Returns:
+        List of blocks in reading order
+    """
+    if not blocks:
+        return []
+
+    if len(blocks) <= 2:
+        # Simple case: sort by position
+        return sorted(blocks, key=lambda b: (b['bounding_box'][1], b['bounding_box'][0]))
+
+    if use_graph:
+        try:
+            return reorder_blocks_by_graph(blocks)
+        except Exception as e:
+            print(f"    - Graph-based reordering failed: {e}. Falling back to column-based.")
+            return reorder_blocks_by_columns(blocks, col_tolerance)
+    else:
+        return reorder_blocks_by_columns(blocks, col_tolerance)

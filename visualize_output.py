@@ -8,41 +8,41 @@ import numpy as np
 from pdf2image import convert_from_path
 from tqdm import tqdm
 
-# Proje klasörlerini tanımla
+# Define project folders
 INPUT_DIR = "input"
 OUTPUT_DIR = "output"
 VISUALIZATIONS_DIR = os.path.join(OUTPUT_DIR, "visualizations")
 
-# Farklı element türleri için renk paleti (BGR formatında)
+# Color palette for different element types (in BGR format)
 COLORS = {
-    "TextBlock": (255, 150, 50),     # Mavi-Turkuaz
-    "Table": (50, 255, 50),          # Yeşil
-    "Figure": (50, 50, 255),         # Kırmızı
-    "Field_Label": (255, 50, 255),    # Mor
-    "Field_Value": (255, 255, 50),    # Açık Mavi
+    "TextBlock": (255, 150, 50),     # Blue-Turquoise
+    "Table": (50, 255, 50),          # Green
+    "Figure": (50, 50, 255),         # Red
+    "Field_Label": (255, 50, 255),    # Purple
+    "Field_Value": (255, 255, 50),    # Light Blue
 }
-DEFAULT_COLOR = (128, 128, 128) # Gri
+DEFAULT_COLOR = (128, 128, 128) # Gray
 
 def draw_box_with_label(image, box, label, color, alpha=0.6):
-    """Bir resim üzerine etiketli ve yarı saydam bir kutu çizer."""
+    """Draws a labeled and semi-transparent box on an image."""
     x1, y1, x2, y2 = map(int, box)
     
-    # Kutu için yarı saydam bir katman oluştur
+    # Create a semi-transparent layer for the box
     overlay = image.copy()
     cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
     
-    # Orijinal resim ile katmanı birleştir
+    # Merge the original image with the layer
     cv2.addWeighted(overlay, alpha, image, 1 - alpha, 0, image)
     
-    # Kutunun dış çerçevesini çiz
+    # Draw the outer frame of the box
     cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
     
-    # Etiket metnini kutunun üzerine yerleştir
+    # Place the label text above the box
     font = cv2.FONT_HERSHEY_SIMPLEX
     font_scale = 0.7
     font_thickness = 2
     
-    # Metin boyutunu alarak etiket için bir arka plan çiz
+    # Draw a background for the label by getting text size
     (text_width, text_height), baseline = cv2.getTextSize(label, font, font_scale, font_thickness)
     label_y = y1 - 10 if y1 - 10 > 10 else y1 + text_height + 10
     
@@ -65,15 +65,15 @@ def main():
         with open(args.json_file, 'r', encoding='utf-8') as f:
             data = json.load(f)
     except FileNotFoundError:
-        print(f"Hata: '{args.json_file}' bulunamadı. Lütfen önce main.py'yi çalıştırın.")
+        print(f"Error: '{args.json_file}' not found. Please run main.py first.")
         return
 
-    print(f"JSON dosyasından {len(data['documents'])} doküman okunuyor...")
+    print(f"Reading {len(data['documents'])} documents from JSON file...")
 
     for doc in tqdm(data['documents'], desc="Visualizing Documents"):
         original_file_path = os.path.join(INPUT_DIR, doc['file'])
         if not os.path.exists(original_file_path):
-            print(f"Uyarı: Orijinal dosya '{doc['file']}' input klasöründe bulunamadı. Atlanıyor.")
+            print(f"Warning: Original file '{doc['file']}' not found in input folder. Skipping.")
             continue
 
         images = []
@@ -91,7 +91,7 @@ def main():
             page_image = images[page_index]
             page_num = page_data['page']
 
-            # --- DÜZELTİLMİŞ ELEMENT ÇİZİM DÖNGÜSÜ ---
+            # --- CORRECTED ELEMENT DRAWING LOOP ---
             for element in page_data.get('elements', []):
                 elem_type = element.get('type')
                 if not elem_type:
@@ -102,7 +102,7 @@ def main():
                 label = elem_type
 
                 if elem_type == 'Table':
-                    # Eğer element bir tablo ise, tüm hücrelerini kapsayan genel bir kutu hesapla
+                    # If element is a table, calculate a general box covering all its cells
                     if 'cells' in element and element['cells']:
                         all_bboxes = [cell['bbox'] for cell in element['cells'] if 'bbox' in cell]
                         if all_bboxes:
@@ -112,16 +112,16 @@ def main():
                             max_y2 = max(b[3] for b in all_bboxes)
                             box = [min_x1, min_y1, max_x2, max_y2]
                 elif 'bounding_box' in element:
-                    # Diğer elementler için doğrudan bounding_box'ı kullan
+                    # For other elements, use bounding_box directly
                     box = element['bounding_box']
                     if elem_type == "Figure" and "kind" in element:
                         label = f"Figure ({element.get('kind', 'unknown')})"
                 
-                # Eğer geçerli bir kutu bulunduysa çiz
+                # If a valid box is found, draw it
                 if box:
                     draw_box_with_label(page_image, box, label, color)
             
-            # Form alanlarını çizme mantığı (değişiklik yok)
+            # Form fields drawing logic (no changes)
             for field_name, field_data in page_data.get('metadata', {}).get('fields', {}).items():
                 if 'label_bbox' in field_data and 'value_bbox' in field_data:
                     label_box = field_data['label_bbox']
@@ -139,7 +139,7 @@ def main():
             output_path = os.path.join(VISUALIZATIONS_DIR, output_filename)
             cv2.imwrite(output_path, page_image)
 
-    print(f"\n✅ Görselleştirme tamamlandı! Çıktılar '{VISUALIZATIONS_DIR}' klasörüne kaydedildi.")
+    print(f"\n✅ Visualization completed! Outputs saved to '{VISUALIZATIONS_DIR}' folder.")
 
 if __name__ == "__main__":
     main()

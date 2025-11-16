@@ -44,6 +44,93 @@ NORMALIZERS = {
     "fax": _normalize_phone,
 }
 
+
+def find_fields_with_llm(text_blocks, description_generator=None):
+    """
+    Uses LLM to extract fields from text blocks.
+
+    This is more resilient to layout variations than rule-based extraction.
+
+    Args:
+        text_blocks: List of text block dictionaries
+        description_generator: DescriptionGenerator instance with Phi-3 model
+
+    Returns:
+        Dictionary of extracted fields.
+    """
+    if description_generator is None or not hasattr(description_generator, 'extract_fields_structured'):
+        return {}
+
+    try:
+        llm_fields = description_generator.extract_fields_structured(text_blocks)
+
+        # Normalize the extracted values
+        normalized_fields = {}
+        for key, value in llm_fields.items():
+            normalized_value = value
+            if key in NORMALIZERS:
+                normalized_value = NORMALIZERS[key](value)
+
+            normalized_fields[key] = {
+                "value": normalized_value,
+                "extraction_method": "llm",
+                "raw_value": value
+            }
+
+        return normalized_fields
+    except Exception as e:
+        print(f"    - LLM field extraction failed: {e}")
+        return {}
+
+
+def find_fields_hybrid(text_blocks, description_generator=None):
+    """
+    Combines rule-based and LLM-based field extraction for best results.
+
+    Strategy:
+    1. First try rule-based extraction (fast, precise for clear layouts)
+    2. For missing fields, use LLM extraction (handles complex layouts)
+    3. Merge results, preferring rule-based when both succeed
+
+    Args:
+        text_blocks: List of text block dictionaries
+        description_generator: Optional DescriptionGenerator instance
+
+    Returns:
+        Dictionary of extracted fields with metadata about extraction method.
+    """
+    # Step 1: Rule-based extraction
+    rule_based_fields = find_fields_by_location(text_blocks)
+
+    # Step 2: LLM-based extraction for missing fields
+    llm_fields = {}
+    if description_generator:
+        # Determine which fields are missing
+        all_possible_fields = list(FIELD_PATTERNS.keys())
+        missing_fields = [f for f in all_possible_fields if f not in rule_based_fields]
+
+        if missing_fields:
+            print(f"    - Using LLM to extract missing fields: {missing_fields}")
+            llm_fields = find_fields_with_llm(text_blocks, description_generator)
+
+    # Step 3: Merge results
+    final_fields = {}
+
+    # Add all rule-based fields first (they have spatial info)
+    for key, value_info in rule_based_fields.items():
+        final_fields[key] = {
+            **value_info,
+            "extraction_method": "rule_based"
+        }
+
+    # Add LLM-extracted fields for missing entries
+    for key, value_info in llm_fields.items():
+        if key not in final_fields:
+            final_fields[key] = value_info
+            print(f"    - LLM found missing field: {key} = {value_info.get('value', '')}")
+
+    return final_fields
+
 def _calculate_distance(label_bbox, value_bbox, direction):
     """
     Calculates the distance between label and value based on direction.

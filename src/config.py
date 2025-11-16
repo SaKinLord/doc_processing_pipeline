@@ -41,6 +41,9 @@ MORPH_KERNEL_SIZE = (25, 3)
 # Tolerance for grouping columns in reading order (pixels)
 COLUMN_REORDER_TOLERANCE = 80
 
+# Use graph-based topological sorting for reading order (handles complex layouts)
+USE_GRAPH_BASED_READING_ORDER = True
+
 # =============================================================================
 #  OCR SETTINGS
 # =============================================================================
@@ -72,8 +75,26 @@ TABLE_LINE_MERGE_TOLERANCE = 5
 # Minimum width/height to be considered as a cell
 TABLE_MIN_CELL_WH = 14
 
+# Enable advanced table structure analysis (merged cells, HTML/Markdown export)
+USE_ADVANCED_TABLE_STRUCTURE = True
+
 # =============================================================================
 #  FIGURE EXTRACTION SETTINGS
 # =============================================================================
 # Maximum vertical distance to scan for a figure caption (pixels)
 FIGURE_CAPTION_V_TOLERANCE = 150
+
+# Enable chart data extraction from figures (bar charts, line charts, etc.)
+EXTRACT_CHART_DATA = True
+
+# =============================================================================
+#  OCR ROUTING SETTINGS
+# =============================================================================
+# Enable OCR routing based on handwriting detection
+# When True, uses pre-classification to route to optimal OCR engine
+# When False, uses the fallback chain approach
+USE_OCR_ROUTING = True
+
+# Minimum confidence for handwriting detection to trigger direct routing
+# Below this threshold, falls back to smart OCR (fallback chain)
+HANDWRITING_DETECTION_THRESHOLD = 0.7

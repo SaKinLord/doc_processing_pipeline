@@ -13,46 +13,55 @@ This project is a locally runnable, self-contained Document AI pipeline that pro
     *   Automatically detects columns and determines correct reading order
 
 ### Advanced OCR Capabilities
-*   **🧠 3-Stage Hybrid OCR System:**
-    *   **Stage 1 - Tesseract:** Fast and effective printed text recognition with adaptive PSM modes
-    *   **Stage 2 - PaddleOCR:** Automatically engaged when Tesseract confidence is low (<70%) for general-purpose and basic handwriting
-    *   **Stage 3 - Microsoft TrOCR:** Specialist model for the most challenging cursive and handwritten text
+*   **🧠 Smart OCR Router with Handwriting Detection:**
+    *   **Pre-Classification:** Automatically detects if text is printed or handwritten before OCR
+    *   **Direct Routing:** Routes to optimal OCR engine (Tesseract for printed, TrOCR for handwritten)
+    *   **Quality Scoring:** Multi-factor text quality assessment (fragmentation, character composition, noise patterns)
+    *   **3-Stage Fallback Chain:** Tesseract → PaddleOCR → TrOCR with intelligent triggering
+    *   **~60% faster processing** by skipping unnecessary OCR stages
 *   **Automatic Language Detection:**
     *   Uses langdetect library with confidence thresholding (98%)
     *   Supports multiple languages: English, Turkish, German, French, Spanish, Indonesian
     *   Language override option for multi-page documents
 
 ### Table & Figure Processing
-*   **Hybrid Table Extraction:**
-    *   **Bordered Tables:** Detects using Hough Transform with morphological enhancement for broken/faint lines
+*   **Advanced Table Structure Recognition:**
+    *   **Merged Cell Detection:** Automatically detects rowspan/colspan by analyzing line continuity
+    *   **Multiple Export Formats:** CSV, HTML (with proper span attributes), Markdown
+    *   **Bordered Tables:** Detects using Hough Transform with morphological enhancement
     *   **Borderless Tables:** Uses alignment-based detection from text block positioning
     *   Validates table structure to distinguish between data tables and forms
-    *   Exports to CSV format with proper grid indexing
 *   **AI-Powered Figure Understanding:**
-    *   **ViT (Vision Transformer):** Classifies figures into 14+ types (bar_chart, line_chart, pie_chart, photo, map, flowchart, network_diagram, blueprint, etc.)
-    *   Intelligent caption detection (searches below and above figures with configurable tolerance)
+    *   **ViT (Vision Transformer):** Classifies figures into 14+ types (bar_chart, line_chart, pie_chart, photo, map, flowchart, etc.)
+    *   **Chart Data Extraction:** Extracts numerical data from bar charts, line charts, pie charts, and scatter plots
+    *   Intelligent caption detection (searches below and above figures)
     *   Filters out false positives using content density analysis
-    *   **Microsoft Phi-3:** Generates natural language descriptions for tables and figures using 4-bit quantization
+    *   **Microsoft Phi-3:** Generates natural language descriptions using 4-bit quantization
 
 ### Form & Field Extraction
-*   **Intelligent Key-Value Pair Detection:**
+*   **Hybrid Rule-Based + LLM Field Extraction:**
+    *   **Rule-Based:** Fast regex matching with multi-directional search (right, below, diagonal)
+    *   **LLM-Enhanced:** Uses Phi-3 to extract fields that patterns miss
     *   Supports common form fields: fax, phone, date, to, from, subject, pages
-    *   Multi-directional search: right, below, and diagonal (right-below)
     *   Automatic data normalization (dates to YYYY-MM-DD, phone numbers to international format)
-    *   Tracks matching direction for debugging
+    *   Tracks extraction method (rule_based or llm)
 
 ### Image Preprocessing
-*   **Noise Robustness:** Advanced preprocessing pipeline for low-quality documents:
-    *   Fast Non-Local Means Denoising (h=7)
+*   **Adaptive Quality-Based Preprocessing:**
+    *   **Automatic Quality Analysis:** Analyzes Laplacian variance, brightness, contrast
+    *   **Dynamic Parameter Selection:** Adjusts denoising and enhancement based on image quality
+    *   **Quality Presets:** clean, normal, noisy, blurry with optimized parameters
     *   Automatic deskewing using Hough Transform
     *   CLAHE (Contrast Limited Adaptive Histogram Equalization)
-    *   Adaptive thresholding (Gaussian method)
 *   **Line Detection & Removal:** Detects and removes table lines for cleaner text extraction
 
 ### Performance & Optimization
-*   **Model Manager:** Pre-loads all AI models at startup to eliminate per-page initialization delays
-*   **Parallel Processing:** Process multiple files concurrently with configurable worker count
+*   **Model Manager:** Pre-loads all 6 AI models at startup (ViT, Phi-3, PaddleOCR, TrOCR, LayoutParser, Handwriting Detector)
+*   **Parallel Processing:**
+    *   **File-Level:** Process multiple files concurrently with ProcessPoolExecutor
+    *   **Page-Level:** Process PDF pages in parallel with ThreadPoolExecutor (NEW!)
 *   **GPU Acceleration:** Full CUDA support for TrOCR, ViT, Phi-3, and LayoutParser models
+*   **Graph-Based Reading Order:** Topological sorting for correct text flow in complex layouts
 *   **Smart Model Loading:** Optional `--no-preload` flag for faster startup with on-demand model loading
 
 ### Security & Privacy
@@ -152,17 +161,20 @@ The pipeline supports several command-line arguments for customization:
 # Custom output filename
 python main.py --output_file my_results.json
 
-# Enable parallel processing for batch operations
-python main.py --parallel
-
-# Parallel processing with custom worker count
+# Enable parallel processing for batch operations (file-level)
 python main.py --parallel --workers 4
+
+# Enable parallel page processing within PDFs (NEW!)
+python main.py --parallel-pages --page-workers 6
+
+# Combine both for maximum performance
+python main.py --parallel --workers 4 --parallel-pages --page-workers 8
 
 # Skip model pre-loading for faster startup (models load on-demand)
 python main.py --no-preload
 
 # Combine multiple options
-python main.py --parallel --workers 2 --output_file batch_results.json
+python main.py --parallel --parallel-pages --output_file batch_results.json
 ```
 
 **Using with Docker:**
@@ -282,18 +294,21 @@ doc_processing_pipeline/
 │   ├── pipeline.py             # Main DocumentProcessor orchestration class
 │   ├── model_manager.py        # Centralized AI model pre-loading and management
 │   │
-│   ├── image_utils.py          # Image loading, preprocessing, deskewing, CLAHE
+│   ├── image_utils.py          # Image loading, adaptive preprocessing, quality analysis
 │   ├── utils.py                # Helper functions (bbox operations, clustering, IoU)
 │   │
-│   ├── layout_detection.py    # Layout analysis (LayoutParser + Tesseract fallback)
-│   ├── ocr.py                  # 3-stage OCR system (Tesseract → Paddle → TrOCR)
+│   ├── layout_detection.py    # Layout analysis + graph-based reading order
+│   ├── ocr.py                  # Smart OCR router with handwriting detection
+│   ├── handwriting_detector.py # Feature-based handwriting vs printed classification (NEW!)
 │   │
 │   ├── table_extraction.py    # Hybrid table detection (bordered + borderless)
+│   ├── table_structure.py      # Advanced table structure with merged cells (NEW!)
 │   ├── figure_extraction.py   # Figure detection and caption finding
 │   ├── classifier.py           # ViT-based figure classification
-│   ├── field_extraction.py    # Form field (key-value) detection
+│   ├── chart_extractor.py      # Extract numerical data from charts (NEW!)
+│   ├── field_extraction.py    # Hybrid rule-based + LLM field extraction
 │   │
-│   └── description_generator.py # Phi-3 LLM for natural language descriptions
+│   └── description_generator.py # Phi-3 LLM for descriptions and field extraction
 │
 ├── main.py                     # Main execution script with CLI arguments
 ├── visualize_output.py         # Visualization tool for annotating processed documents
@@ -417,12 +432,12 @@ Then update `DEFAULT_OCR_LANG` in `config.py`.
 ## ⚠️ Known Limitations
 
 ### Current Limitations
-*   **Merged Cells:** Table extraction does not support merged/spanning cells yet
 *   **LLM Hallucinations:** AI-generated descriptions may occasionally contain plausible but incorrect information
-*   **Complex Layouts:** Multi-column layouts with irregular structures may have reading order issues
 *   **Rotated Text:** Text at angles other than 0/90/180/270 degrees may not be detected correctly
 *   **Handwriting Quality:** TrOCR works best with clear, structured handwriting; highly cursive or messy handwriting may have lower accuracy
 *   **Non-Latin Scripts:** PaddleOCR is configured for Latin scripts; support for Asian languages requires model reconfiguration
+*   **Chart Data Extraction:** Relative values only; absolute values require OCR of axis labels
+*   **Handwriting Detection:** Uses heuristic features; custom training data can improve accuracy
 
 ### Performance Considerations
 *   **First Run:** Initial startup is slow due to model downloads (~5-10 minutes depending on internet speed)
@@ -434,11 +449,11 @@ Then update `DEFAULT_OCR_LANG` in `config.py`.
 
 Contributions are welcome! Areas for improvement:
 - Support for more languages (Arabic, Chinese, Japanese, etc.)
-- Merged cell handling in tables
-- Improved handwriting recognition
-- Better figure caption association
-- Optimized GPU memory usage
-- Additional export formats (Excel, Word, Markdown)
+- Fine-tuning layout detection model on specific document types
+- Training custom CNN for handwriting detection
+- Excel export format for tables
+- Improved chart axis label OCR for absolute values
+- Optimized GPU memory usage for parallel processing
 
 ## 📄 License
 

@@ -28,6 +28,12 @@ try:
 except ImportError:
     LAYOUTPARSER_AVAILABLE = False
 
+try:
+    from .handwriting_detector import HandwritingDetector
+    HANDWRITING_DETECTOR_AVAILABLE = True
+except ImportError:
+    HANDWRITING_DETECTOR_AVAILABLE = False
+
 
 class ModelManager:
     """
@@ -44,6 +50,7 @@ class ModelManager:
     trocr_processor = None
     trocr_model = None
     layout_model = None
+    handwriting_detector = None
     
     def __new__(cls):
         if cls._instance is None:
@@ -66,27 +73,27 @@ class ModelManager:
         print("INITIALIZING MODEL MANAGER")
         print("Pre-loading all AI models to improve per-page processing speed...")
         print("="*70)
-        
+
         instance = cls()
-        
+
         # 1. Figure Classifier (ViT)
-        print("\n[1/5] Loading Figure Classifier (ViT)...")
+        print("\n[1/6] Loading Figure Classifier (ViT)...")
         try:
             instance.figure_classifier = FigureClassifier()
             print("      ✅ Figure Classifier loaded")
         except Exception as e:
             print(f"      ❌ Failed to load Figure Classifier: {e}")
-        
+
         # 2. Description Generator (Phi-3)
-        print("\n[2/5] Loading Description Generator (Phi-3)...")
+        print("\n[2/6] Loading Description Generator (Phi-3)...")
         try:
             instance.description_generator = DescriptionGenerator()
             print("      ✅ Description Generator loaded")
         except Exception as e:
             print(f"      ❌ Failed to load Description Generator: {e}")
-        
+
         # 3. PaddleOCR
-        print("\n[3/5] Loading PaddleOCR...")
+        print("\n[3/6] Loading PaddleOCR...")
         if PADDLE_AVAILABLE and load_all:
             try:
                 instance.paddle_ocr = PaddleOCR(use_angle_cls=True, lang='latin', show_log=False)
@@ -95,9 +102,9 @@ class ModelManager:
                 print(f"      ❌ Failed to load PaddleOCR: {e}")
         else:
             print("      ⊘ PaddleOCR not available or skipped")
-        
+
         # 4. TrOCR
-        print("\n[4/5] Loading TrOCR (Handwriting Expert)...")
+        print("\n[4/6] Loading TrOCR (Handwriting Expert)...")
         if TROCR_AVAILABLE and torch.cuda.is_available() and load_all:
             try:
                 model_id = "microsoft/trocr-base-handwritten"
@@ -108,9 +115,9 @@ class ModelManager:
                 print(f"      ❌ Failed to load TrOCR: {e}")
         else:
             print("      ⊘ TrOCR not available, CUDA unavailable, or skipped")
-        
+
         # 5. LayoutParser
-        print("\n[5/5] Loading LayoutParser Model...")
+        print("\n[5/6] Loading LayoutParser Model...")
         if LAYOUTPARSER_AVAILABLE and load_all:
             try:
                 instance.layout_model = lp.models.PaddleDetectionLayoutModel(
@@ -125,6 +132,17 @@ class ModelManager:
                 print(f"      ❌ Failed to load LayoutParser: {e}")
         else:
             print("      ⊘ LayoutParser not available or skipped")
+
+        # 6. Handwriting Detector
+        print("\n[6/6] Loading Handwriting Detector...")
+        if HANDWRITING_DETECTOR_AVAILABLE and load_all:
+            try:
+                instance.handwriting_detector = HandwritingDetector()
+                print("      ✅ Handwriting Detector loaded")
+            except Exception as e:
+                print(f"      ❌ Failed to load Handwriting Detector: {e}")
+        else:
+            print("      ⊘ Handwriting Detector not available or skipped")
         
         cls._initialized = True
         print("\n" + "="*70)
@@ -157,3 +175,8 @@ class ModelManager:
     def get_layout_model(cls):
         """Returns the pre-loaded LayoutParser model."""
         return cls._instance.layout_model if cls._instance else None
+
+    @classmethod
+    def get_handwriting_detector(cls):
+        """Returns the pre-loaded handwriting detector."""
+        return cls._instance.handwriting_detector if cls._instance else None
