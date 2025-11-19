@@ -1,5 +1,3 @@
-# src/config.py
-
 import os
 from pathlib import Path
 
@@ -19,12 +17,14 @@ FIGURES_DIR = OUTPUT_DIR / "figure_crops"
 # DPI value to use when converting PDF to image
 PDF_TO_IMAGE_DPI = 300
 
-# Denoising 'h' parameter
-DENOISING_H = 7
+# Denoising 'h' parameter (Denoising strength)
+# CHANGED: Increased from 7 to 10. Better for noisy fax documents.
+DENOISING_H = 10 
 
 # Adaptive thresholding parameters
-ADAPTIVE_THRESH_BLOCK_SIZE = 35
-ADAPTIVE_THRESH_C = 11
+# CHANGED: Block size increased; cleans shadowy areas better.
+ADAPTIVE_THRESH_BLOCK_SIZE = 45 
+ADAPTIVE_THRESH_C = 15
 
 # Hough Lines threshold for deskew (skew correction)
 DESKEW_HOUGH_THRESHOLD = 200

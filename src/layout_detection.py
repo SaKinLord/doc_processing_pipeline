@@ -1,5 +1,3 @@
-# src/layout_detection.py
-
 import cv2
 import numpy as np
 import pandas as pd
@@ -22,13 +20,10 @@ def _initialize_layout_model():
     if _layout_model is None and LAYOUTPARSER_AVAILABLE:
         try:
             print("    - Initializing LayoutParser model (PaddleDetection)...")
-            # Using PaddleDetection model for layout analysis
             _layout_model = lp.models.PaddleDetectionLayoutModel(
-                config_path="lp://PubLayNet/ppyolov2_r50vd_dcn_365e_publaynet/config",
-                threshold=0.5,
+                config_path="lp://PubLayNet/picodet_lcnet_x1_0_fgd_layout/config",
                 label_map={0: "Text", 1: "Title", 2: "List", 3: "Table", 4: "Figure"},
-                enforce_cpu=False,  # Use GPU if available
-                enable_mkldnn=True
+                enforce_cpu=False  # Use GPU if available
             )
             print("    - ✅ LayoutParser model initialized successfully.")
         except Exception as e:
@@ -39,11 +34,36 @@ def _initialize_layout_model():
 def group_words_into_blocks(df, tolerance=20):
     """
     Groups word DataFrame from Tesseract into semantic text blocks.
+    Respects columns by checking horizontal gaps.
     """
     if df.empty:
         return []
 
-    df['line_group'] = (df['top'].diff() > tolerance).cumsum()
+    # Sort by top then left to handle reading order roughly
+    df = df.sort_values(by=['top', 'left'])
+
+    # Calculate vertical difference between consecutive words
+    df['v_diff'] = df['top'].diff().fillna(0)
+    
+    # Calculate horizontal difference (gap) between consecutive words
+    # We need to compare current 'left' with previous 'right' (left + width)
+    df['prev_right'] = (df['left'] + df['width']).shift(1).fillna(0)
+    df['h_diff'] = df['left'] - df['prev_right']
+    
+    # A new block starts if:
+    # 1. Vertical gap is large (new paragraph/section)
+    # 2. Horizontal gap is very large (likely across columns), even if on same line
+    
+    # Define thresholds
+    V_THRESHOLD = tolerance
+    H_THRESHOLD = 100  # Large gap indicating column break
+    
+    # Vectorized condition for new block
+    # Note: h_diff check only applies if v_diff is small (same line)
+    is_new_block = (df['v_diff'] > V_THRESHOLD) | \
+                   ((df['v_diff'].abs() < 20) & (df['h_diff'] > H_THRESHOLD))
+                   
+    df['line_group'] = is_new_block.cumsum()
 
     blocks = []
     for _, group in df.groupby('line_group'):
@@ -52,16 +72,16 @@ def group_words_into_blocks(df, tolerance=20):
         x2 = (group['left'] + group['width']).max()
         y2 = (group['top'] + group['height']).max()
         
-        text_lines = []
-        for block_num, line_df in group.groupby(['block_num', 'line_num']):
-            line_text = ' '.join(line_df['text'].astype(str))
-            text_lines.append(line_text)
+        # Extract text
+        # We can just join all words with spaces, Tesseract usually handles word spacing well enough in the DF
+        full_text = " ".join(group['text'].astype(str))
         
-        full_text = '\n'.join(text_lines)
+        # Clean up extra spaces
+        full_text = utils.normalize_text_basic(full_text)
 
         blocks.append({
             "bounding_box": [float(x1), float(y1), float(x2), float(y2)],
-            "content": utils.normalize_text_basic(full_text),
+            "content": full_text,
             "type": "TextBlock"
         })
     return blocks

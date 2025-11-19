@@ -24,7 +24,7 @@ except ImportError:
 
 try:
     import layoutparser as lp
-    LAYOUTPARSER_AVAILABLE = True
+    LAYOUTPARSER_AVAILABLE = False 
 except ImportError:
     LAYOUTPARSER_AVAILABLE = False
 
@@ -120,12 +120,12 @@ class ModelManager:
         print("\n[5/6] Loading LayoutParser Model...")
         if LAYOUTPARSER_AVAILABLE and load_all:
             try:
+                # FIX: Changed model path from 'ppyolov2' to 'picodet'.
+                # This model is newer, faster, and less error-prone.
                 instance.layout_model = lp.models.PaddleDetectionLayoutModel(
-                    config_path="lp://PubLayNet/ppyolov2_r50vd_dcn_365e_publaynet/config",
-                    threshold=0.5,
+                    config_path="lp://PubLayNet/picodet_lcnet_x1_0_fgd_layout/config",
                     label_map={0: "Text", 1: "Title", 2: "List", 3: "Table", 4: "Figure"},
-                    enforce_cpu=False,
-                    enable_mkldnn=True
+                    enforce_cpu=False
                 )
                 print("      ✅ LayoutParser Model loaded")
             except Exception as e:

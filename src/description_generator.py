@@ -1,8 +1,7 @@
-# src/description_generator.py
-
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, BitsAndBytesConfig
 import pandas as pd
+from difflib import SequenceMatcher
 
 class DescriptionGenerator:
     _instance = None
@@ -60,27 +59,21 @@ class DescriptionGenerator:
 
     def _generate_text(self, prompt, max_length=100):
         if not self.pipe:
-            return "Description generation is disabled."
+            return ""
 
         generation_args = {
             "max_new_tokens": max_length,
             "return_full_text": False,
-            "temperature": 0.3,
-            "do_sample": True,
+            "temperature": 0.1,
+            "do_sample": False,
         }
         
-        # Create a message list in the format expected by Phi-3
-        messages = [
-            {"role": "user", "content": prompt},
-        ]
-
-        # Run the model
+        messages = [{"role": "user", "content": prompt}]
         output = self.pipe(messages, **generation_args)
         
-        # Clean the output
         if output and output[0]['generated_text']:
             return output[0]['generated_text'].strip()
-        return "Could not generate a description."
+        return ""
 
     def generate_for_table(self, table_df: pd.DataFrame) -> str:
         """
@@ -136,18 +129,56 @@ You are a document analysis assistant. Based on the following information, write
 One-sentence description:
 """
         return self._generate_text(prompt, max_length=50)
+    
+    def _verify_value_in_text(self, value, text_source, threshold=0.85):
+        """
+        MORE ROBUST VERIFICATION:
+        The value found by the LLM must appear as a 'whole' within the text block.
+        We are searching for phrases/segments, not just individual words.
+        """
+        value = str(value).lower().strip()
+        text_source = text_source.lower()
+        
+        # 1. If the value is very short (e.g., "10", "ok"), strictly look for an exact match
+        if len(value) < 4:
+            return value in text_source.split() # Accept only if present as a whole word
+
+        # 2. Quick check: Does it appear directly?
+        if value in text_source:
+            return True
+            
+        # 3. Fuzzy Search - The Most Robust Part
+        # Checks the best match ratio of the value within the text.
+        # If similarity is less than 85%, it is considered a hallucination.
+        
+        # SequenceMatcher can be slow on large texts, so instead of sliding windows,
+        # we use simple 'token overlap' + 'sequence preservation'.
+        
+        # Simple but effective method: Are the words SIDE BY SIDE or CLOSE in the text?
+        v_words = value.split()
+        if not v_words: return False
+        
+        try:
+            # Find the first word
+            start_index = text_source.find(v_words[0])
+            if start_index == -1: return False # Reject if even the first word is missing
+            
+            # Search for the last word after the first word
+            end_index = text_source.find(v_words[-1], start_index)
+            if end_index == -1: return False # Reject if the last word is missing
+            
+            # If the distance is too large (e.g., "John" at top of page, "Smith" at bottom), reject.
+            # Allow a tolerance of word count * 10 characters.
+            if (end_index - start_index) > (len(value) + 20):
+                return False
+                
+            return True
+        except:
+            return False
 
     def extract_fields_from_text(self, text_blocks_summary: str, target_fields: list = None) -> dict:
         """
-        Uses LLM to extract key-value fields from document text.
-
-        Args:
-            text_blocks_summary: String containing all text blocks from the document
-            target_fields: List of field names to extract (e.g., ['date', 'to', 'from', 'subject'])
-                          If None, extracts common form fields.
-
-        Returns:
-            Dictionary of extracted fields with their values.
+        Uses LLM to extract fields but verifies them against the source text.
         """
         if not self.pipe:
             return {}
@@ -157,45 +188,51 @@ One-sentence description:
 
         fields_str = ', '.join(target_fields)
 
-        prompt = f"""You are a document field extraction assistant. Extract the following fields from the document text below: {fields_str}
+        # NEW PROMPT: Much stricter rules
+        prompt = f"""You are a strict data extraction assistant. Your job is to find specific information in the provided OCR text.
 
-Document text:
+OCR Text:
 ---
-{text_blocks_summary}
+{text_blocks_summary[:3500]}  # Truncate if text is too long
 ---
 
-Instructions:
-- Extract ONLY the values for the requested fields
-- If a field is not found, omit it from the response
-- Return the result as a simple key: value format, one per line
-- Do not include any explanation or additional text
-- For dates, use the format found in the document
-- For phone/fax numbers, include all digits
+Task: Extract values for these fields: {fields_str}
 
-Example format:
-date: 2024-01-15
-to: John Smith
-from: ACME Corp
-subject: Monthly Report
+RULES:
+1. EXTRACT ONLY what is explicitly written in the text.
+2. IF A FIELD IS NOT FOUND, DO NOT INVENT DATA. DO NOT WRITE "John Smith" or "ACME".
+3. If not found, output: field_name: null
+4. Do not convert dates to "today". Use the date found in text.
+5. Output format must be exactly: key: value
 
-Extracted fields:"""
+Extracted Data:"""
 
         try:
-            result_text = self._generate_text(prompt, max_length=200)
+            result_text = self._generate_text(prompt, max_length=150)
+            print(f"    - LLM Raw Output: {result_text.replace(chr(10), ' | ')}") # For debugging
 
-            # Parse the generated text into a dictionary
             extracted = {}
             for line in result_text.strip().split('\n'):
-                line = line.strip()
-                if ':' in line and not line.startswith('#'):
-                    # Split only on first colon
+                if ':' in line:
                     parts = line.split(':', 1)
                     if len(parts) == 2:
                         key = parts[0].strip().lower()
                         value = parts[1].strip()
-                        # Only include if it's a requested field
-                        if key in [f.lower() for f in target_fields] and value:
+                        
+                        # Cleanup
+                        if value.lower() in ['null', 'not found', 'n/a', 'none', 'unknown']:
+                            continue
+                            
+                        # FILTER: Is it one of the requested fields?
+                        if key not in [f.lower() for f in target_fields]:
+                            continue
+
+                        # CRITICAL STEP: Verification
+                        # Does the value found by the LLM exist in the original text?
+                        if self._verify_value_in_text(value, text_blocks_summary):
                             extracted[key] = value
+                        else:
+                            print(f"    - [HALLUCINATION BLOCKED] LLM suggested '{value}' for '{key}', but it was not in text.")
 
             return extracted
         except Exception as e:

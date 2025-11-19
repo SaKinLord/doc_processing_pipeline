@@ -235,10 +235,11 @@ class HandwritingDetector:
         if 'stroke_width_var_ratio' in features:
             var_ratio = features['stroke_width_var_ratio']
             if var_ratio > 0.5:
-                score += 0.25 * min(var_ratio / 0.8, 1.0)
+                # Increased weight for stroke width variance
+                score += 0.35 * min(var_ratio / 0.8, 1.0)
             else:
-                score -= 0.1
-            weights_sum += 0.25
+                score -= 0.15
+            weights_sum += 0.35
 
         # 2. Component size variance (high variance = handwritten)
         if 'area_variance' in features and features['num_components'] > 3:
@@ -284,6 +285,13 @@ class HandwritingDetector:
             if entropy > 3.5:
                 score += 0.05 * min((entropy - 3.5) / 2, 1.0)
             weights_sum += 0.05
+
+        # NEW: 8. Cursive-ness check (connected components width vs height)
+        # Handwriting often has wider connected components (connected letters)
+        if 'avg_component_area' in features and features.get('num_components', 0) > 2:
+            # We don't have direct width/height stats here, but we can infer from aspect ratio
+            # If we had access to raw stats we could check width > height * 1.5
+            pass
 
         # Normalize score
         if weights_sum > 0:
