@@ -7,7 +7,7 @@ This project is a locally runnable, self-contained Document AI pipeline that pro
 ### Core Document Processing
 *   **Multi-Format Support:** Processes common document and image formats like PDF, PNG, JPG, JPEG, BMP, and TIFF.
 *   **Intelligent Layout Analysis:**
-    *   Uses LayoutParser with PaddleDetection (PubLayNet model) for advanced layout detection
+    *   Uses LayoutParser with PaddleDetection (PicoDet model) for advanced layout detection (lightweight & fast)
     *   Automatically falls back to Tesseract-based layout analysis if LayoutParser is unavailable
     *   Detects text blocks, titles, lists, tables, and figures with confidence scores
     *   Automatically detects columns and determines correct reading order
@@ -17,7 +17,8 @@ This project is a locally runnable, self-contained Document AI pipeline that pro
     *   **Pre-Classification:** Automatically detects if text is printed or handwritten before OCR
     *   **Direct Routing:** Routes to optimal OCR engine (Tesseract for printed, TrOCR for handwritten)
     *   **Quality Scoring:** Multi-factor text quality assessment (fragmentation, character composition, noise patterns)
-    *   **3-Stage Fallback Chain:** Tesseract → PaddleOCR → TrOCR with intelligent triggering
+    *   **3-Stage Fallback Chain:** Tesseract → PaddleOCR → TrOCR with intelligent triggering based on confidence scores (<60%) and fragmentation analysis.
+    *   **Noise Filtering:** Automatically discards OCR results with extremely low quality scores to prevent garbage data output.
     *   **~60% faster processing** by skipping unnecessary OCR stages
 *   **Automatic Language Detection:**
     *   Uses langdetect library with confidence thresholding (98%)
@@ -42,6 +43,10 @@ This project is a locally runnable, self-contained Document AI pipeline that pro
 *   **Hybrid Rule-Based + LLM Field Extraction:**
     *   **Rule-Based:** Fast regex matching with multi-directional search (right, below, diagonal)
     *   **LLM-Enhanced:** Uses Phi-3 to extract fields that patterns miss
+    *   **🛡️ Hallucination Prevention System:**
+        *   **Strict Verification:** Every value extracted by LLM is cross-verified against the source text using fuzzy substring matching.
+        *   **Blacklist Filtering:** Automatically blocks generic placeholders (e.g., "John Smith", "ACME Corp") and common LLM hallucinations.
+        *   **Zero-Hallucination Guarantee:** If a field is not explicitly present in the document, it returns null instead of inventing data.
     *   Supports common form fields: fax, phone, date, to, from, subject, pages
     *   Automatic data normalization (dates to YYYY-MM-DD, phone numbers to international format)
     *   Tracks extraction method (rule_based or llm)
@@ -93,7 +98,7 @@ This project is a locally runnable, self-contained Document AI pipeline that pro
 *   **ViT:** `google/vit-base-patch16-224` - Figure classification with 1000+ ImageNet classes
 *   **Phi-3:** `microsoft/Phi-3-mini-4k-instruct` - LLM for natural language description generation (4-bit quantized)
 *   **PaddleOCR:** Latin script model - General purpose OCR with handwriting support
-*   **LayoutParser:** PubLayNet PaddleDetection model - Document layout detection (5 classes)
+*   **LayoutParser:** PicoDet PaddleDetection model - Document layout detection (5 classes)
 
 ### Development Stack
 *   **Containerization:** Docker with NVIDIA CUDA 12.1 runtime (nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04)
@@ -432,7 +437,7 @@ Then update `DEFAULT_OCR_LANG` in `config.py`.
 ## ⚠️ Known Limitations
 
 ### Current Limitations
-*   **LLM Hallucinations:** AI-generated descriptions may occasionally contain plausible but incorrect information
+*   **LLM Hallucinations:** Significantly reduced via verification layers, though AI-generated *descriptions* (summaries) may still occasionally contain minor inaccuracies. Field extraction is strictly verified.
 *   **Rotated Text:** Text at angles other than 0/90/180/270 degrees may not be detected correctly
 *   **Handwriting Quality:** TrOCR works best with clear, structured handwriting; highly cursive or messy handwriting may have lower accuracy
 *   **Non-Latin Scripts:** PaddleOCR is configured for Latin scripts; support for Asian languages requires model reconfiguration
