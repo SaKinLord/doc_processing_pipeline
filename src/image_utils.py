@@ -62,18 +62,9 @@ def deskew(gray_image):
 
     return deskewed
 
-
 def analyze_image_quality(bgr_image):
     """
     Analyzes image quality to determine optimal preprocessing parameters.
-
-    Returns a dictionary with:
-    - laplacian_variance: Measure of image sharpness/noise (higher = sharper/noisier)
-    - brightness: Average brightness (0-255)
-    - contrast: Standard deviation of pixel values
-    - quality_preset: Recommended preprocessing preset ('clean', 'normal', 'noisy', 'blurry')
-    - denoising_h: Recommended denoising strength
-    - clahe_clip_limit: Recommended CLAHE clip limit
     """
     gray = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2GRAY)
 
@@ -91,32 +82,26 @@ def analyze_image_quality(bgr_image):
     clahe_clip_limit = 2.0  # Default
 
     if laplacian_var > 1500:
-        # High variance: Very sharp or very noisy image
         quality_preset = 'noisy'
         denoising_h = 12
         clahe_clip_limit = 1.5
     elif laplacian_var > 800:
-        # Medium-high variance: Sharp image with some noise
         quality_preset = 'normal'
         denoising_h = 7
         clahe_clip_limit = 2.0
     elif laplacian_var > 200:
-        # Medium variance: Clean image
         quality_preset = 'clean'
         denoising_h = 3
         clahe_clip_limit = 2.5
     else:
-        # Low variance: Blurry image
         quality_preset = 'blurry'
-        denoising_h = 5  # Light denoising to avoid further blur
-        clahe_clip_limit = 3.0  # Higher contrast enhancement
+        denoising_h = 5
+        clahe_clip_limit = 3.0
 
     # Adjust for brightness
     if brightness < 100:
-        # Dark image - increase contrast enhancement
         clahe_clip_limit = min(clahe_clip_limit + 1.0, 4.0)
     elif brightness > 200:
-        # Very bright image - reduce contrast enhancement
         clahe_clip_limit = max(clahe_clip_limit - 0.5, 1.0)
 
     return {
@@ -128,22 +113,14 @@ def analyze_image_quality(bgr_image):
         'clahe_clip_limit': clahe_clip_limit
     }
 
-
 def preprocess_for_ocr(bgr_image, denoising_h=7, clahe_clip_limit=2.0,
                        adaptive_block_size=35, adaptive_c=11):
     """
-    Applies preprocessing pipeline for OCR with configurable parameters.
-
-    Args:
-        bgr_image: Input BGR image
-        denoising_h: Denoising strength (higher = more denoising)
-        clahe_clip_limit: CLAHE clip limit for contrast enhancement
-        adaptive_block_size: Block size for adaptive thresholding
-        adaptive_c: Constant for adaptive thresholding
+    Applies standard preprocessing pipeline for OCR (Printed Text).
+    Stronger denoising and binarization.
     """
     gray = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2GRAY)
 
-    # Apply denoising with configurable strength
     if denoising_h > 0:
         gray = cv2.fastNlMeansDenoising(gray, h=denoising_h)
 
@@ -159,8 +136,35 @@ def preprocess_for_ocr(bgr_image, denoising_h=7, clahe_clip_limit=2.0,
 
     return bin_img
 
+def preprocess_for_handwriting(roi_bgr):
+    """
+    NEW: Specialized preprocessing for handwritten text regions.
+    Applies minimal denoising to preserve faint strokes and avoids harsh binarization.
+    TrOCR works best with grayscale or soft-processed RGB images.
+    """
+    if roi_bgr is None or roi_bgr.size == 0:
+        return roi_bgr
+
+    # 1. Convert to Grayscale
+    gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+
+    # 2. Very Light Denoising (h=3 is usually safe for handwriting)
+    # Avoid h=10 or higher as it erases pencil strokes
+    gray = cv2.fastNlMeansDenoising(gray, h=3)
+
+    # 3. Slight Contrast Enhancement (CLAHE)
+    # Helps separate ink from paper texture without destroying stroke edges
+    clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
+    enhanced_gray = clahe.apply(gray)
+
+    # 4. Return as BGR (TrOCR expects 3 channels)
+    # We do NOT binarize here because TrOCR is trained on natural images
+    result_bgr = cv2.cvtColor(enhanced_gray, cv2.COLOR_GRAY2BGR)
+    
+    return result_bgr
+
 def find_document_corners(bgr_image):
-    """Finds the corners of the largest rectangle in the image (for perspective correction)."""
+    """Finds the corners of the largest rectangle in the image."""
     gray = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
     edges = cv2.Canny(gray, 75, 200)
@@ -178,7 +182,7 @@ def find_document_corners(bgr_image):
     return None
 
 def four_point_transform(image, pts):
-    """Applies perspective correction to the image based on the found four corners."""
+    """Applies perspective correction."""
     rect = np.array(pts, dtype="float32")
     (tl, tr, br, bl) = rect
     

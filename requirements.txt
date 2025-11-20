@@ -11,7 +11,7 @@ opencv-python-headless==4.10.0.84
 # OCR and Language Detection
 pytesseract==0.3.10
 langdetect==1.0.9
-paddlepaddle==2.6.1
+paddlepaddle==2.6.2
 paddleocr==2.8.1
 
 # PDF Processing

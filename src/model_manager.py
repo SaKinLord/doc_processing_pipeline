@@ -1,10 +1,5 @@
 # src/model_manager.py
 
-"""
-Central Model Manager
-Pre-loads all AI models at startup to avoid per-page initialization delays.
-"""
-
 from .classifier import FigureClassifier
 from .description_generator import DescriptionGenerator
 import torch
@@ -24,7 +19,7 @@ except ImportError:
 
 try:
     import layoutparser as lp
-    LAYOUTPARSER_AVAILABLE = False 
+    LAYOUTPARSER_AVAILABLE = True
 except ImportError:
     LAYOUTPARSER_AVAILABLE = False
 
@@ -36,10 +31,6 @@ except ImportError:
 
 
 class ModelManager:
-    """
-    Singleton class that pre-loads and manages all AI models.
-    Call ModelManager.initialize() once at startup to load all models.
-    """
     _instance = None
     _initialized = False
     
@@ -59,12 +50,6 @@ class ModelManager:
     
     @classmethod
     def initialize(cls, load_all=True):
-        """
-        Pre-loads all available AI models.
-        
-        Args:
-            load_all: If True, loads all models. If False, loads only essential ones.
-        """
         if cls._initialized:
             print("ModelManager already initialized.")
             return
@@ -120,16 +105,16 @@ class ModelManager:
         print("\n[5/6] Loading LayoutParser Model...")
         if LAYOUTPARSER_AVAILABLE and load_all:
             try:
-                # FIX: Changed model path from 'ppyolov2' to 'picodet'.
-                # This model is newer, faster, and less error-prone.
+                # Picodet is lighter and faster
                 instance.layout_model = lp.models.PaddleDetectionLayoutModel(
                     config_path="lp://PubLayNet/picodet_lcnet_x1_0_fgd_layout/config",
                     label_map={0: "Text", 1: "Title", 2: "List", 3: "Table", 4: "Figure"},
-                    enforce_cpu=False
+                    enforce_cpu=False 
                 )
                 print("      ✅ LayoutParser Model loaded")
             except Exception as e:
-                print(f"      ❌ Failed to load LayoutParser: {e}")
+                print(f"      ⊘ LayoutParser not available or skipped (Will fallback to Tesseract)")
+                instance.layout_model = None
         else:
             print("      ⊘ LayoutParser not available or skipped")
 
@@ -151,32 +136,26 @@ class ModelManager:
     
     @classmethod
     def get_figure_classifier(cls):
-        """Returns the pre-loaded figure classifier."""
         return cls._instance.figure_classifier if cls._instance else None
     
     @classmethod
     def get_description_generator(cls):
-        """Returns the pre-loaded description generator."""
         return cls._instance.description_generator if cls._instance else None
     
     @classmethod
     def get_paddle_ocr(cls):
-        """Returns the pre-loaded PaddleOCR instance."""
         return cls._instance.paddle_ocr if cls._instance else None
     
     @classmethod
     def get_trocr(cls):
-        """Returns the pre-loaded TrOCR processor and model."""
         if cls._instance:
             return cls._instance.trocr_processor, cls._instance.trocr_model
         return None, None
     
     @classmethod
     def get_layout_model(cls):
-        """Returns the pre-loaded LayoutParser model."""
         return cls._instance.layout_model if cls._instance else None
 
     @classmethod
     def get_handwriting_detector(cls):
-        """Returns the pre-loaded handwriting detector."""
         return cls._instance.handwriting_detector if cls._instance else None
