@@ -7,10 +7,11 @@ This project is a locally runnable, self-contained Document AI pipeline that pro
 ### Core Document Processing
 *   **Multi-Format Support:** Processes common document and image formats like PDF, PNG, JPG, JPEG, BMP, and TIFF.
 *   **Intelligent Layout Analysis:**
-    *   Uses LayoutParser with PaddleDetection (PicoDet model) for advanced layout detection (lightweight & fast)
-    *   Automatically falls back to Tesseract-based layout analysis if LayoutParser is unavailable
+    *   **Default:** Tesseract-based layout analysis (PSM 3) with superior text detection
+    *   **Optional:** LayoutParser with PaddleDetection for specialized table/figure detection (configurable via `USE_LAYOUTPARSER`)
     *   Detects text blocks, titles, lists, tables, and figures with confidence scores
-    *   Automatically detects columns and determines correct reading order
+    *   Automatically detects columns and determines correct reading order with graph-based topological sorting
+    *   **Class-aware NMS** prevents false suppression of overlapping elements
 
 ### Advanced OCR Capabilities
 *   **🧠 Smart OCR Router with Handwriting Detection:**
@@ -98,7 +99,7 @@ This project is a locally runnable, self-contained Document AI pipeline that pro
 *   **ViT:** `google/vit-base-patch16-224` - Figure classification with 1000+ ImageNet classes
 *   **Phi-3:** `microsoft/Phi-3-mini-4k-instruct` - LLM for natural language description generation (4-bit quantized)
 *   **PaddleOCR:** Latin script model - General purpose OCR with handwriting support
-*   **LayoutParser:** PicoDet PaddleDetection model - Document layout detection (5 classes)
+*   **LayoutParser:** PPYOLOv2 PaddleDetection model - Optional layout detection (disabled by default; Tesseract recommended for text-heavy documents)
 
 ### Development Stack
 *   **Containerization:** Docker with NVIDIA CUDA 12.1 runtime (nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04)
@@ -362,9 +363,14 @@ The pipeline can be customized by editing `src/config.py`:
 - `DESKEW_HOUGH_THRESHOLD`: Hough Lines threshold for deskew (default: 200)
 
 ### Layout Analysis
+- `USE_LAYOUTPARSER`: Enable/disable LayoutParser for layout detection (default: False)
+  - **Recommended: False** - Tesseract provides better text detection for most documents
+  - Set to True only if you need specialized table/figure detection
+  - See "LayoutParser Configuration" section below for details
 - `BLOCK_MIN_AREA`: Minimum area for text blocks in pixels (default: 500)
 - `MORPH_KERNEL_SIZE`: Morphological kernel size for merging lines (default: (25, 3))
 - `COLUMN_REORDER_TOLERANCE`: Tolerance for grouping columns (default: 80)
+- `USE_GRAPH_BASED_READING_ORDER`: Use topological sorting for reading order (default: True)
 
 ### OCR Settings
 - `DEFAULT_OCR_LANG`: Default Tesseract language (default: "eng+tur")
@@ -380,6 +386,84 @@ The pipeline can be customized by editing `src/config.py`:
 
 ### Figure Extraction
 - `FIGURE_CAPTION_V_TOLERANCE`: Max vertical distance for caption search (default: 150)
+- `EXTRACT_CHART_DATA`: Enable chart data extraction from figures (default: True)
+
+### OCR Routing
+- `USE_OCR_ROUTING`: Enable handwriting-aware OCR routing (default: True)
+- `HANDWRITING_DETECTION_THRESHOLD`: Minimum confidence for handwriting detection (default: 0.7)
+
+## 🔍 LayoutParser Configuration
+
+### Important: LayoutParser Text Detection Limitations
+
+**Default Setting: `USE_LAYOUTPARSER = False` (Recommended)**
+
+LayoutParser with PaddleDetection has known limitations with text detection that can significantly impact extraction quality:
+
+**Issue:** The PaddleDetection model (ppyolov2_r50vd_dcn_365e) tends to:
+- Classify entire pages as single Figure or Table regions
+- Miss most text blocks (detecting only 10-20% of actual text)
+- Produce large overlapping bounding boxes
+- Perform poorly compared to Tesseract for text-heavy documents
+
+**Comparison Results:**
+| Layout Engine | Text Blocks Detected | Tables/Figures | Quality |
+|--------------|---------------------|----------------|---------|
+| Tesseract (Recommended) | ~26 blocks | 0 | High accuracy |
+| LayoutParser (PaddleDetection) | ~3 blocks | 3 (often false) | Poor text detection |
+
+### When to Use LayoutParser
+
+Enable LayoutParser (`USE_LAYOUTPARSER = True`) only if:
+- You have documents with complex layouts requiring precise table/figure localization
+- You can install Detectron2 backend (significantly more accurate than PaddleDetection)
+- Text extraction is secondary to structural element detection
+- You're willing to accept reduced text detection quality
+
+### Fixes Applied
+
+The following architectural improvements have been implemented:
+
+1. **Class-Aware NMS** (`src/layout_detection.py`)
+   - Non-Maximum Suppression now operates per-class
+   - Text boxes won't be suppressed by overlapping Table/Figure boxes
+   - Prevents valid detections from being filtered out
+
+2. **Original Image for Layout Detection** (`src/pipeline.py`, `src/layout_detection.py`)
+   - LayoutParser now receives the original unprocessed image
+   - Previously used line-removed image which confused the model
+   - OCR still uses preprocessed image for better text extraction
+
+3. **Configurable Threshold** (`src/model_manager.py`)
+   - Detection threshold lowered to 0.3 for better recall
+   - Adjustable via `extra_config` parameter
+
+### Alternative: Install Detectron2 (Advanced)
+
+For significantly better results, install Detectron2 backend:
+
+**Linux/macOS:**
+```bash
+pip install 'git+https://github.com/facebookresearch/detectron2.git'
+```
+
+**Windows:** Requires Visual Studio Build Tools (complex setup)
+
+**Note:** Detectron2 models provide 3-5x better accuracy than PaddleDetection but require compilation.
+
+### Diagnostic Tools
+
+Test LayoutParser performance on your documents:
+
+```bash
+# Test layout detection
+python test_layoutparser.py
+
+# Compare LayoutParser vs Tesseract
+python test_pipeline_text.py
+```
+
+These scripts output detection statistics to help you choose the best configuration.
 
 ## 🏗️ Processing Pipeline
 
@@ -388,7 +472,10 @@ Each document page goes through an 8-step processing pipeline:
 1. **Image Preparation:** Load image → Apply denoising → Deskew → CLAHE → Adaptive threshold
 2. **Line Detection & Removal:** Find horizontal/vertical lines → Create line-free image for better text extraction
 3. **Language Detection:** Quick OCR scan → Detect language with confidence → Set Tesseract language
-4. **Layout Analysis:** LayoutParser/Tesseract → Detect text blocks, tables, figures → Reorder by columns
+4. **Layout Analysis:**
+   - Default: Tesseract PSM 3 → Detect text blocks → Group into semantic blocks
+   - Optional (if `USE_LAYOUTPARSER=True`): LayoutParser → Class-aware NMS → Detect text, tables, figures
+   - Reorder blocks using graph-based topological sorting for correct reading order
 5. **Table Extraction:**
    - Check for lined tables (Hough Transform)
    - Validate table structure (distinguish from forms)
@@ -434,15 +521,58 @@ Then update `DEFAULT_OCR_LANG` in `config.py`.
 - Check document language matches DEFAULT_OCR_LANG
 - Verify GPU is being used (check console output for CUDA messages)
 
+### LayoutParser Text Detection Issues
+
+**Symptoms:**
+- Very few text blocks detected (< 5 blocks on text-heavy pages)
+- Most text blocks are empty or incomplete
+- Entire pages classified as single Figure or Table
+- "Using Tesseract for layout analysis (Fallback)" message appears
+
+**Solutions:**
+
+1. **Disable LayoutParser (Recommended):**
+   ```python
+   # In src/config.py
+   USE_LAYOUTPARSER = False
+   ```
+   This uses Tesseract for layout analysis, which provides much better text detection.
+
+2. **Lower Detection Threshold:**
+   ```python
+   # In src/model_manager.py, line 115
+   extra_config={'threshold': 0.1}  # Try values between 0.1-0.3
+   ```
+
+3. **Verify Model Initialization:**
+   - Ensure `ModelManager.initialize()` is called before processing
+   - Check for "LayoutParser Model loaded" message in console
+   - Without initialization, pipeline falls back to Tesseract automatically
+
+4. **Run Diagnostic Tests:**
+   ```bash
+   python test_layoutparser.py      # Test model directly
+   python test_pipeline_text.py     # Test full pipeline
+   ```
+
+5. **Consider Detectron2:**
+   - Install Detectron2 backend for 3-5x better accuracy
+   - Requires compilation (easier on Linux/macOS than Windows)
+   - See "LayoutParser Configuration" section for details
+
+**Note:** The default configuration (`USE_LAYOUTPARSER = False`) is recommended for most use cases as Tesseract provides superior text detection compared to PaddleDetection.
+
 ## ⚠️ Known Limitations
 
 ### Current Limitations
+*   **LayoutParser Text Detection:** PaddleDetection backend has poor text detection performance (detects ~10-20% of text blocks). **Default configuration uses Tesseract** which provides significantly better results. Enable LayoutParser only for specialized table/figure detection needs.
 *   **LLM Hallucinations:** Significantly reduced via verification layers, though AI-generated *descriptions* (summaries) may still occasionally contain minor inaccuracies. Field extraction is strictly verified.
 *   **Rotated Text:** Text at angles other than 0/90/180/270 degrees may not be detected correctly
 *   **Handwriting Quality:** TrOCR works best with clear, structured handwriting; highly cursive or messy handwriting may have lower accuracy
 *   **Non-Latin Scripts:** PaddleOCR is configured for Latin scripts; support for Asian languages requires model reconfiguration
 *   **Chart Data Extraction:** Relative values only; absolute values require OCR of axis labels
 *   **Handwriting Detection:** Uses heuristic features; custom training data can improve accuracy
+*   **Detectron2 Installation:** Superior LayoutParser backend requires compilation; difficult to install on Windows systems
 
 ### Performance Considerations
 *   **First Run:** Initial startup is slow due to model downloads (~5-10 minutes depending on internet speed)

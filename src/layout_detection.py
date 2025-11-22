@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import pytesseract
 from . import utils
-from .config import DEFAULT_OCR_LANG
+from .config import DEFAULT_OCR_LANG, USE_LAYOUTPARSER
 
 # NEW: LayoutParser integration
 try:
@@ -98,27 +98,94 @@ def detect_text_blocks_tesseract(bgr_image, lang=DEFAULT_OCR_LANG):
     
     return blocks
 
+def _calculate_iou(box1, box2):
+    """Calculate Intersection over Union (IoU) between two bounding boxes."""
+    x1_min, y1_min, x1_max, y1_max = box1
+    x2_min, y2_min, x2_max, y2_max = box2
+
+    # Calculate intersection
+    inter_x_min = max(x1_min, x2_min)
+    inter_y_min = max(y1_min, y2_min)
+    inter_x_max = min(x1_max, x2_max)
+    inter_y_max = min(y1_max, y2_max)
+
+    if inter_x_max <= inter_x_min or inter_y_max <= inter_y_min:
+        return 0.0
+
+    inter_area = (inter_x_max - inter_x_min) * (inter_y_max - inter_y_min)
+
+    # Calculate union
+    box1_area = (x1_max - x1_min) * (y1_max - y1_min)
+    box2_area = (x2_max - x2_min) * (y2_max - y2_min)
+    union_area = box1_area + box2_area - inter_area
+
+    return inter_area / union_area if union_area > 0 else 0.0
+
+def _apply_nms(elements, iou_threshold=0.5):
+    """
+    Apply Class-Aware Non-Maximum Suppression to remove overlapping detections.
+    Only suppresses boxes within the same class - Text boxes won't suppress Table/Figure boxes.
+    This allows text regions inside tables/figures to be preserved.
+    """
+    if not elements:
+        return elements
+
+    # Group elements by type for class-aware NMS
+    by_class = {}
+    for elem in elements:
+        class_type = elem.get('layout_type', elem['type'])
+        if class_type not in by_class:
+            by_class[class_type] = []
+        by_class[class_type].append(elem)
+
+    # Apply NMS within each class
+    all_kept = []
+    for class_type, class_elements in by_class.items():
+        # Sort by confidence (descending)
+        sorted_elements = sorted(class_elements, key=lambda x: x['confidence'], reverse=True)
+
+        keep = []
+        while sorted_elements:
+            # Take the highest confidence element
+            current = sorted_elements.pop(0)
+            keep.append(current)
+
+            # Remove elements that significantly overlap with current (same class only)
+            filtered = []
+            for elem in sorted_elements:
+                iou = _calculate_iou(current['bounding_box'], elem['bounding_box'])
+                # Keep if IoU is below threshold (not overlapping much)
+                if iou < iou_threshold:
+                    filtered.append(elem)
+
+            sorted_elements = filtered
+
+        all_kept.extend(keep)
+
+    return all_kept
+
 def detect_layout_with_model(bgr_image):
     """
     Uses LayoutParser with a pre-trained model to detect layout elements.
+    Applies Non-Maximum Suppression to filter overlapping detections.
     """
     _initialize_layout_model()
-    
+
     if _layout_model is None:
         return None
-    
+
     try:
         # Convert BGR to RGB for layoutparser
         rgb_image = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
-        
+
         # Detect layout
         layout = _layout_model.detect(rgb_image)
-        
+
         elements = []
         for block in layout:
             x1, y1, x2, y2 = block.coordinates
             element_type = block.type
-            
+
             # Map layoutparser types to our types
             type_map = {
                 "Text": "TextBlock",
@@ -127,36 +194,57 @@ def detect_layout_with_model(bgr_image):
                 "Table": "Table",
                 "Figure": "Figure"
             }
-            
+
             elements.append({
                 "bounding_box": [float(x1), float(y1), float(x2), float(y2)],
                 "type": type_map.get(element_type, "TextBlock"),
                 "layout_type": element_type,
                 "confidence": float(block.score)
             })
-        
+
+        # Apply Non-Maximum Suppression to remove overlapping detections
+        # This is critical for PaddleDetection models which often output redundant boxes
+        num_before_nms = len(elements)
+        elements = _apply_nms(elements, iou_threshold=0.5)
+        num_after_nms = len(elements)
+
+        if num_before_nms > num_after_nms:
+            print(f"    - NMS filtered: {num_before_nms} → {num_after_nms} elements (removed {num_before_nms - num_after_nms} overlapping)")
+
         # Sort by reading order
         elements.sort(key=lambda e: (e['bounding_box'][1], e['bounding_box'][0]))
-        
+
         return elements
-        
+
     except Exception as e:
         print(f"    - [WARNING] LayoutParser failed for this page: {e}")
         return None
 
-def detect_text_blocks(bgr_image, lang=DEFAULT_OCR_LANG):
+def detect_text_blocks(bgr_image, lang=DEFAULT_OCR_LANG, original_image=None):
     """
-    First tries LayoutParser model, falls back to Tesseract if unavailable.
+    First tries LayoutParser model (if enabled), falls back to Tesseract if unavailable or disabled.
+
+    Args:
+        bgr_image: Preprocessed image (with lines removed) for Tesseract OCR
+        lang: Language code for Tesseract
+        original_image: Original unprocessed image for LayoutParser (if None, uses bgr_image)
     """
-    # Try using layoutparser model first
-    layout_elements = detect_layout_with_model(bgr_image)
-    
-    if layout_elements is not None:
-        # print("    - Using LayoutParser model for layout analysis")
-        return layout_elements
-    else:
-        print("    - Using Tesseract for layout analysis (Fallback)")
-        return detect_text_blocks_tesseract(bgr_image, lang)
+    # Check if LayoutParser is enabled in config
+    if USE_LAYOUTPARSER:
+        # Use original image for layout detection (LayoutParser trained on raw images)
+        # Use preprocessed image only if original not provided
+        layout_input = original_image if original_image is not None else bgr_image
+
+        # Try using layoutparser model first
+        layout_elements = detect_layout_with_model(layout_input)
+
+        if layout_elements is not None:
+            # print("    - Using LayoutParser model for layout analysis")
+            return layout_elements
+
+    # Fall back to Tesseract if LayoutParser is disabled or failed
+    print("    - Using Tesseract for layout analysis (Fallback)")
+    return detect_text_blocks_tesseract(bgr_image, lang)
 
 def reorder_blocks_by_columns(blocks, col_tolerance=80):
     if not blocks:

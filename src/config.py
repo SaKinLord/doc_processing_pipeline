@@ -32,6 +32,12 @@ DESKEW_HOUGH_THRESHOLD = 200
 # =============================================================================
 #  LAYOUT ANALYSIS SETTINGS
 # =============================================================================
+# Enable LayoutParser for layout detection (if False, falls back to Tesseract)
+# Note: LayoutParser with PaddleDetection has known limitations with text detection.
+# Tesseract often provides better text detection results. Set to False if experiencing
+# poor text detection or class collapse issues.
+USE_LAYOUTPARSER = False  # Recommended: Keep disabled for better text detection
+
 # Minimum area to be considered as a text block (square pixels)
 BLOCK_MIN_AREA = 500
 

@@ -228,7 +228,12 @@ class DocumentProcessor:
     def _extract_text_blocks(self):
         print("  [4/8] Performing layout analysis and OCR on clean image...")
 
-        detected_elements = layout_detection.detect_text_blocks(self.bgr_image_no_lines, lang=self.detected_lang_tess)
+        # Pass original image for LayoutParser, preprocessed image for Tesseract/OCR
+        detected_elements = layout_detection.detect_text_blocks(
+            self.bgr_image_no_lines,
+            lang=self.detected_lang_tess,
+            original_image=self.bgr_image  # Original image for better layout detection
+        )
         temp_elements = []
         textblock_counter = 0
 

@@ -105,15 +105,19 @@ class ModelManager:
         print("\n[5/6] Loading LayoutParser Model...")
         if LAYOUTPARSER_AVAILABLE and load_all:
             try:
-                # Picodet is lighter and faster
+                # Note: PaddleDetection models may have lower accuracy than Detectron2
+                # Using PPYOLOv2 with adjusted threshold to reduce class collapse
                 instance.layout_model = lp.models.PaddleDetectionLayoutModel(
-                    config_path="lp://PubLayNet/picodet_lcnet_x1_0_fgd_layout/config",
+                    config_path="lp://PubLayNet/ppyolov2_r50vd_dcn_365e/config",
                     label_map={0: "Text", 1: "Title", 2: "List", 3: "Table", 4: "Figure"},
-                    enforce_cpu=False 
+                    enforce_cpu=False,
+                    extra_config={
+                        'threshold': 0.3,  # Lower threshold for better recall across all classes
+                    }
                 )
-                print("      ✅ LayoutParser Model loaded")
+                print("      ✅ LayoutParser Model loaded (threshold=0.3 for better class diversity)")
             except Exception as e:
-                print(f"      ⊘ LayoutParser not available or skipped (Will fallback to Tesseract)")
+                print(f"      ⊘ LayoutParser not available or skipped (Will fallback to Tesseract): {e}")
                 instance.layout_model = None
         else:
             print("      ⊘ LayoutParser not available or skipped")
