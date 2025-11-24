@@ -83,11 +83,13 @@ def analyze_image_quality(bgr_image):
 
     if laplacian_var > 1500:
         quality_preset = 'noisy'
-        denoising_h = 12
+        # CRITICAL FIX: Cap denoising at 5 to preserve handwriting
+        # Previous value of 12 was destroying faint ink strokes
+        denoising_h = 5
         clahe_clip_limit = 1.5
     elif laplacian_var > 800:
         quality_preset = 'normal'
-        denoising_h = 7
+        denoising_h = 5  # Also capped at 5 for consistency
         clahe_clip_limit = 2.0
     elif laplacian_var > 200:
         quality_preset = 'clean'
@@ -148,19 +150,23 @@ def preprocess_for_handwriting(roi_bgr):
     # 1. Convert to Grayscale
     gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
 
-    # 2. Very Light Denoising (h=3 is usually safe for handwriting)
-    # Avoid h=10 or higher as it erases pencil strokes
+    # 2. Minimal Denoising (h=3 to preserve faint ink strokes)
     gray = cv2.fastNlMeansDenoising(gray, h=3)
 
-    # 3. Slight Contrast Enhancement (CLAHE)
-    # Helps separate ink from paper texture without destroying stroke edges
-    clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
+    # 3. CLAHE for contrast enhancement without destroying stroke edges
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
     enhanced_gray = clahe.apply(gray)
 
-    # 4. Return as BGR (TrOCR expects 3 channels)
+    # 4. Sharpening to enhance stroke clarity
+    sharpening_kernel = np.array([[0, -1, 0],
+                                   [-1, 5, -1],
+                                   [0, -1, 0]])
+    sharpened = cv2.filter2D(enhanced_gray, -1, sharpening_kernel)
+
+    # 5. Convert back to BGR (TrOCR expects 3 channels)
     # We do NOT binarize here because TrOCR is trained on natural images
-    result_bgr = cv2.cvtColor(enhanced_gray, cv2.COLOR_GRAY2BGR)
-    
+    result_bgr = cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR)
+
     return result_bgr
 
 def find_document_corners(bgr_image):

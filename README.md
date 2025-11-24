@@ -18,8 +18,12 @@ This project is a locally runnable, self-contained Document AI pipeline that pro
     *   **Pre-Classification:** Automatically detects if text is printed or handwritten before OCR
     *   **Direct Routing:** Routes to optimal OCR engine (Tesseract for printed, TrOCR for handwritten)
     *   **Quality Scoring:** Multi-factor text quality assessment (fragmentation, character composition, noise patterns)
-    *   **3-Stage Fallback Chain:** Tesseract → PaddleOCR → TrOCR with intelligent triggering based on confidence scores (<60%) and fragmentation analysis.
-    *   **Noise Filtering:** Automatically discards OCR results with extremely low quality scores to prevent garbage data output.
+    *   **3-Stage Fallback Chain:** Tesseract → PaddleOCR → TrOCR with intelligent triggering based on confidence scores (<60%) and fragmentation analysis
+    *   **🔒 TrOCR Hallucination Prevention:**
+        *   **Deterministic Generation:** Uses temperature=0.1, no_repeat_ngram_size=3 for consistent outputs
+        *   **Line Segmentation:** Splits text blocks into individual lines before processing (prevents gibberish on multi-line inputs)
+        *   **Garbage Filtering:** Discards outputs <2 characters with no alphanumeric content
+    *   **Noise Filtering:** Automatically discards OCR results with extremely low quality scores to prevent garbage data output
     *   **~60% faster processing** by skipping unnecessary OCR stages
 *   **Automatic Language Detection:**
     *   Uses langdetect library with confidence thresholding (98%)
@@ -30,14 +34,23 @@ This project is a locally runnable, self-contained Document AI pipeline that pro
 *   **Advanced Table Structure Recognition:**
     *   **Merged Cell Detection:** Automatically detects rowspan/colspan by analyzing line continuity
     *   **Multiple Export Formats:** CSV, HTML (with proper span attributes), Markdown
-    *   **Bordered Tables:** Detects using Hough Transform with morphological enhancement
+    *   **Bordered Tables:** Detects using Hough Transform with morphological enhancement (min_len=400px to reject handwriting)
     *   **Borderless Tables:** Uses alignment-based detection from text block positioning
-    *   Validates table structure to distinguish between data tables and forms
+    *   **🛡️ Strict Validation to Prevent False Positives:**
+        *   **Page Coverage Cap:** Rejects tables covering >65% of page with <3 columns (prevents full-page text detection)
+        *   **Minimum Cell Count:** Requires ≥4 cells for valid table
+        *   **Column Structure:** Rejects single-column "tables" (just rows of text)
+        *   **Line Length Threshold:** Table lines must be ≥400px (filters out handwriting strokes)
 *   **AI-Powered Figure Understanding:**
     *   **ViT (Vision Transformer):** Classifies figures into 14+ types (bar_chart, line_chart, pie_chart, photo, map, flowchart, etc.)
     *   **Chart Data Extraction:** Extracts numerical data from bar charts, line charts, pie charts, and scatter plots
     *   Intelligent caption detection (searches below and above figures)
-    *   Filters out false positives using content density analysis
+    *   **🛡️ Multi-Layer False Positive Prevention:**
+        *   **Edge Density Check:** Rejects regions with <1% edge density (filters empty margins/solid blocks)
+        *   **Aspect Ratio Filter:** Rejects extremely thin boxes (width/height or height/width <0.1) to filter page margins
+        *   **Size Floor:** Rejects specks <1% of page area
+        *   **Text Overlap:** Rejects candidates overlapping >5% with text or touching >2 text blocks
+        *   **Morphological Kernel:** Minimal (3×3) to prevent merging independent noise
     *   **Microsoft Phi-3:** Generates natural language descriptions using 4-bit quantization
 
 ### Form & Field Extraction
@@ -57,8 +70,10 @@ This project is a locally runnable, self-contained Document AI pipeline that pro
     *   **Automatic Quality Analysis:** Analyzes Laplacian variance, brightness, contrast
     *   **Dynamic Parameter Selection:** Adjusts denoising and enhancement based on image quality
     *   **Quality Presets:** clean, normal, noisy, blurry with optimized parameters
+    *   **🔒 Handwriting Preservation:** Denoising globally capped at 5 to preserve faint ink strokes (prevents over-smoothing)
     *   Automatic deskewing using Hough Transform
     *   CLAHE (Contrast Limited Adaptive Histogram Equalization)
+    *   **Specialized Handwriting Preprocessing:** Minimal denoising (h=3), enhanced CLAHE (2.5), sharpening kernel
 *   **Line Detection & Removal:** Detects and removes table lines for cleaner text extraction
 
 ### Performance & Optimization
@@ -357,9 +372,9 @@ The pipeline can be customized by editing `src/config.py`:
 
 ### Image Preprocessing
 - `PDF_TO_IMAGE_DPI`: DPI for PDF conversion (default: 300)
-- `DENOISING_H`: Denoising strength parameter (default: 7)
-- `ADAPTIVE_THRESH_BLOCK_SIZE`: Block size for adaptive thresholding (default: 35)
-- `ADAPTIVE_THRESH_C`: Constant for adaptive thresholding (default: 11)
+- `DENOISING_H`: Denoising strength parameter (default: 5, **globally capped at 5 to preserve handwriting**)
+- `ADAPTIVE_THRESH_BLOCK_SIZE`: Block size for adaptive thresholding (default: 45)
+- `ADAPTIVE_THRESH_C`: Constant for adaptive thresholding (default: 15)
 - `DESKEW_HOUGH_THRESHOLD`: Hough Lines threshold for deskew (default: 200)
 
 ### Layout Analysis
@@ -379,14 +394,25 @@ The pipeline can be customized by editing `src/config.py`:
 - `LANG_DETECT_CONFIDENCE_THRESHOLD`: Language detection confidence (default: 0.98)
 
 ### Table Extraction
-- `TABLE_HOUGH_MIN_LINE_LEN`: Minimum line length for Hough Transform (default: 80)
+- `TABLE_HOUGH_MIN_LINE_LEN`: Minimum line length for Hough Transform (default: **400**, increased to reject handwriting strokes)
 - `TABLE_HOUGH_MAX_LINE_GAP`: Maximum line gap (default: 10)
 - `TABLE_LINE_MERGE_TOLERANCE`: Tolerance for merging nearby lines (default: 5)
 - `TABLE_MIN_CELL_WH`: Minimum cell width/height (default: 14)
+- **Strict Validation Thresholds:**
+  - Maximum page coverage for tables: **65%** (with <3 columns)
+  - Minimum cells required: **4**
+  - Minimum columns required: **2**
 
 ### Figure Extraction
 - `FIGURE_CAPTION_V_TOLERANCE`: Max vertical distance for caption search (default: 150)
 - `EXTRACT_CHART_DATA`: Enable chart data extraction from figures (default: True)
+- **Strict Validation Thresholds:**
+  - Morphological kernel: **(3, 3)** (minimal merging to prevent false blobs)
+  - Edge density minimum: **1%** (0.01) - rejects empty margins and solid blocks
+  - Aspect ratio limits: **0.1** (rejects vertical/horizontal lines)
+  - Size floor: **1% of page area** (rejects noise specks)
+  - Text overlap maximum: **5%** (down from 50%)
+  - Text blocks intersection maximum: **2** (valid figures touch ≤2 text blocks)
 
 ### OCR Routing
 - `USE_OCR_ROUTING`: Enable handwriting-aware OCR routing (default: True)
@@ -561,6 +587,36 @@ Then update `DEFAULT_OCR_LANG` in `config.py`.
    - See "LayoutParser Configuration" section for details
 
 **Note:** The default configuration (`USE_LAYOUTPARSER = False`) is recommended for most use cases as Tesseract provides superior text detection compared to PaddleDetection.
+
+## 🎯 Recent Improvements (v2.0)
+
+### False Positive Prevention
+*   **Table Detection:**
+    - Increased minimum line length to 400px (from 80px) to prevent handwriting strokes from being detected as table lines
+    - Added page coverage cap: tables covering >65% of page must have ≥3 columns (prevents full-page text layouts)
+    - Enforced minimum cell count (≥4 cells) and column structure (≥2 columns)
+    - Handwritten pages no longer detected as giant tables ✅
+
+*   **Figure Detection:**
+    - Reduced morphological kernel to (3,3) to prevent merging independent noise
+    - Added edge density check (≥1%) to filter empty margins and solid blocks
+    - Added aspect ratio filter (<0.1) to reject page margin lines
+    - Added size floor (≥1% of page) to reject noise specks
+    - Reduced text overlap threshold from 50% to 5%
+    - Added text blocks intersection limit (≤2 blocks)
+    - Page margins and text-heavy regions no longer detected as figures ✅
+
+### Handwriting Recognition Enhancements
+*   **Denoising Cap:**
+    - Global maximum set to 5 (down from 12 for noisy images)
+    - Preserves faint ink strokes that were previously destroyed
+    - Applied across all quality presets (noisy, normal, blurry)
+
+*   **TrOCR Improvements:**
+    - Deterministic generation (temperature=0.1, no_repeat_ngram_size=3)
+    - Line segmentation before processing (prevents multi-line gibberish)
+    - Garbage output filtering (<2 chars with no alphanumeric)
+    - Specialized preprocessing (minimal denoise, CLAHE 2.5, sharpening kernel)
 
 ## ⚠️ Known Limitations
 

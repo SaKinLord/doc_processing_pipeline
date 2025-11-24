@@ -18,8 +18,8 @@ FIGURES_DIR = OUTPUT_DIR / "figure_crops"
 PDF_TO_IMAGE_DPI = 300
 
 # Denoising 'h' parameter (Denoising strength)
-# CHANGED: Increased from 7 to 10. Better for noisy fax documents.
-DENOISING_H = 10 
+# CHANGED: Reduced to 5 to preserve faint handwriting strokes
+DENOISING_H = 5 
 
 # Adaptive thresholding parameters
 # CHANGED: Block size increased; cleans shadowy areas better.

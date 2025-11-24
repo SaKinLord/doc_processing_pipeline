@@ -341,7 +341,7 @@ class DocumentProcessor:
                     cells = table_extraction.lines_to_cells(merged_h, merged_v)
                     text_blocks = [el for el in self.elements if el['type'] == 'TextBlock']
 
-                    if table_extraction.validate_table_structure(cells, text_blocks) and len(cells) >= 4:
+                    if table_extraction.validate_table_structure(cells, text_blocks, self.width, self.height) and len(cells) >= 4:
                         table_cells_data = []
                         for cell_box in cells:
                             text, _ = ocr.ocr_smart(
@@ -383,7 +383,11 @@ class DocumentProcessor:
                                 roi_text_blocks.append(el)
 
                     if len(roi_text_blocks) >= 4:
-                        table_candidate_blocks = table_extraction.find_borderless_table_blocks(roi_text_blocks)
+                        table_candidate_blocks = table_extraction.find_borderless_table_blocks(
+                            roi_text_blocks,
+                            page_width=self.width,
+                            page_height=self.height
+                        )
 
                         if len(table_candidate_blocks) >= 4:
                             table_cells_data = []
@@ -427,8 +431,8 @@ class DocumentProcessor:
             if len(merged_h) >= 2 and len(merged_v) >= 2 and not found_lined_table:
                 cells = table_extraction.lines_to_cells(merged_h, merged_v)
                 text_blocks = [el for el in self.elements if el['type'] == 'TextBlock']
-                
-                if len(cells) >= 4 and table_extraction.validate_table_structure(cells, text_blocks):
+
+                if len(cells) >= 4 and table_extraction.validate_table_structure(cells, text_blocks, self.width, self.height):
                     table_cells_data = []
                     for cell_box in cells:
                         text, _ = ocr.ocr_smart(
@@ -458,7 +462,11 @@ class DocumentProcessor:
 
             if not found_lined_table:
                 text_blocks_for_table = [el for el in self.elements if el['type'] == 'TextBlock']
-                table_candidate_blocks = table_extraction.find_borderless_table_blocks(text_blocks_for_table)
+                table_candidate_blocks = table_extraction.find_borderless_table_blocks(
+                    text_blocks_for_table,
+                    page_width=self.width,
+                    page_height=self.height
+                )
 
                 if len(table_candidate_blocks) >= 4:
                     table_cells_data = []
@@ -530,7 +538,11 @@ class DocumentProcessor:
 
         if not figures_found:
             print("    - No LayoutParser figure ROIs. Using full-page morphological detection...")
-            figure_boxes = figure_extraction.find_figure_candidates(self.binarized_inv)
+            figure_boxes = figure_extraction.find_figure_candidates(
+                self.binarized_inv,
+                original_bgr_image=self.bgr_image,
+                text_blocks=text_blocks
+            )
 
             for i, box in enumerate(figure_boxes):
                 box_area = (box[2] - box[0]) * (box[3] - box[1])
@@ -548,7 +560,10 @@ class DocumentProcessor:
                         intersecting_tbs.append(tb)
                         text_overlap_area += (intersection_x2 - intersection_x1) * (intersection_y2 - intersection_y1)
 
-                if (text_overlap_area / box_area) > 0.5: continue
+                # CRITICAL: Reject if figure overlaps with >5% text area OR intersects >2 text blocks
+                # A valid figure might overlap with 1 caption, but 3+ text blocks = page background
+                if (text_overlap_area / box_area) > 0.05: continue
+                if len(intersecting_tbs) > 2: continue
 
                 x1, y1, x2, y2 = map(int, box)
                 roi_h, roi_w = y2 - y1, x2 - x1

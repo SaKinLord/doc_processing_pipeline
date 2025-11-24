@@ -7,25 +7,135 @@ from .classifier import FigureClassifier # NEW: Import the classifier
 # Create the classifier instance at module level once (lazy loading)
 _figure_classifier_instance = None
 
-def find_figure_candidates(binarized_image_inv):
-    """Finds large and compact areas with low text density as figure candidates."""
+def validate_figure_candidate(box, original_bgr_image, text_blocks=None):
+    """
+    Validates a figure candidate box to eliminate false positives.
+
+    Returns True if the candidate passes validation, False otherwise.
+    """
+    x1, y1, x2, y2 = map(int, box)
+
+    # Safety check for valid coordinates
+    h, w = original_bgr_image.shape[:2]
+    if x1 < 0 or y1 < 0 or x2 > w or y2 > h or x2 <= x1 or y2 <= y1:
+        return False
+
+    box_width = x2 - x1
+    box_height = y2 - y1
+    box_area = box_width * box_height
+    page_area = w * h
+
+    # STRICT CHECK 1: Size Floor - Reject very small specks (< 1% of page)
+    if box_area < 0.01 * page_area:
+        return False
+
+    # STRICT CHECK 2: Aspect Ratio Filter - Reject extremely thin/tall boxes
+    # These are likely margin lines, page borders, or artifacts
+    if box_width > 0 and box_height > 0:
+        width_to_height = box_width / box_height
+        height_to_width = box_height / box_width
+
+        # Reject vertical lines (width/height < 0.1)
+        if width_to_height < 0.1:
+            return False
+
+        # Reject horizontal lines (height/width < 0.1)
+        if height_to_width < 0.1:
+            return False
+
+    roi = original_bgr_image[y1:y2, x1:x2]
+
+    if roi.size == 0:
+        return False
+
+    # STRICT CHECK 3: Edge Density Check - Reject empty regions with no visual content
+    gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray_roi, 50, 150)
+
+    total_pixels = edges.size
+    edge_pixels = np.count_nonzero(edges)
+    edge_density = (edge_pixels / total_pixels) * 100.0
+
+    # STRICT: Valid figures must have significant internal detail (>= 1%)
+    # Real figures/charts have lines and visual elements; empty margins do not
+    if edge_density < 1.0:
+        return False
+
+    # STRICT CHECK 4: Text Overlap Check - Reject if figure overlaps significantly with text blocks
+    if text_blocks is not None:
+        for text_block in text_blocks:
+            tx1, ty1, tx2, ty2 = text_block['bounding_box']
+
+            # Calculate intersection area
+            overlap_x1 = max(x1, tx1)
+            overlap_y1 = max(y1, ty1)
+            overlap_x2 = min(x2, tx2)
+            overlap_y2 = min(y2, ty2)
+
+            if overlap_x2 > overlap_x1 and overlap_y2 > overlap_y1:
+                overlap_area = (overlap_x2 - overlap_x1) * (overlap_y2 - overlap_y1)
+                overlap_ratio = (overlap_area / box_area) * 100.0
+
+                # Reject if overlap with ANY text block exceeds 10%
+                if overlap_ratio > 10.0:
+                    return False
+
+    return True
+
+def find_figure_candidates(binarized_image_inv, original_bgr_image=None, text_blocks=None):
+    """
+    Finds large and compact areas with low text density as figure candidates.
+    Uses strict validation to eliminate false positives.
+    """
     h, w = binarized_image_inv.shape[:2]
-    
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 15))
+
+    # CRITICAL FIX: Further reduced kernel to (3,3) to stop merging independent elements
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     blobs = cv2.morphologyEx(binarized_image_inv, cv2.MORPH_CLOSE, kernel, iterations=2)
-    
+
     contours, _ = cv2.findContours(blobs, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    
+
     boxes = []
     for cnt in contours:
         x, y, ww, hh = cv2.boundingRect(cnt)
         area = ww * hh
-        
+
+        # Basic size filtering
         if area < 0.02 * h * w or area > 0.8 * h * w:
             continue
-            
-        boxes.append([float(x), float(y), float(x + ww), float(y + hh)])
-        
+
+        candidate_box = [float(x), float(y), float(x + ww), float(y + hh)]
+
+        # CRITICAL FIX: Add density filter directly in candidate loop
+        # Check edge density to reject empty margin regions
+        if original_bgr_image is not None:
+            x1, y1, x2, y2 = int(x), int(y), int(x + ww), int(y + hh)
+            # Boundary check
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
+
+            if x2 > x1 and y2 > y1:
+                roi = original_bgr_image[y1:y2, x1:x2]
+                if roi.size > 0:
+                    # Calculate Canny edge density
+                    gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                    edges = cv2.Canny(gray_roi, 50, 150)
+                    edge_density = np.count_nonzero(edges) / area if area > 0 else 0
+
+                    # STRICT: Reject if edge density < 1% (0.01)
+                    # Real figures/charts have internal lines and details
+                    # Empty page margins or solid blocks do not
+                    if edge_density < 0.01:
+                        continue
+
+        # Strict validation: Only add if it passes all checks
+        # Better to miss a figure than to mark the entire page as a figure
+        if original_bgr_image is not None:
+            if not validate_figure_candidate(candidate_box, original_bgr_image, text_blocks):
+                continue
+
+        boxes.append(candidate_box)
+
     return boxes
 
 # --- COMPLETELY RENEWED ---

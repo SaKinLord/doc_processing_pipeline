@@ -5,10 +5,13 @@ import numpy as np
 import pandas as pd
 from . import utils
 
-def find_lines(binarized_image_inv, min_len=80, gap=10, threshold=120):
+def find_lines(binarized_image_inv, min_len=400, gap=10, threshold=200):
     """
     ENHANCED: Finds horizontal and vertical lines in the image using Hough Transform.
     Now applies morphological operations to connect broken/faint lines first.
+
+    CRITICAL: min_len=400 and threshold=200 prevent handwriting strokes from being
+    detected as table lines. Real tables have long lines (>400px); handwriting does not.
     """
     # NEW: Apply morphological operations to connect broken lines
     # This makes faint, dashed, or broken lines more solid and easier to detect
@@ -108,15 +111,80 @@ def lines_to_cells(horizontal_lines, vertical_lines, min_cell_wh=14):
                 cells.append([float(x1), float(y1), float(x2), float(y2)])
     return cells
 
-def validate_table_structure(cells, text_blocks, occupied_cell_ratio_threshold=0.2, iou_threshold=0.8):
+def validate_table_structure(cells, text_blocks, page_width, page_height, occupied_cell_ratio_threshold=0.2, iou_threshold=0.8):
     """
     Validates whether a grid is a real table or a form based on the distribution
-    of text blocks within it.
+    of text blocks within it. Includes strict checks to prevent false positives.
     """
     if not cells or not text_blocks:
         return False
 
     total_cells = len(cells)
+
+    # STRICT CHECK 1: Minimum cell count - reject tables with fewer than 4 cells
+    if total_cells < 4:
+        return False
+
+    # STRICT CHECK 2: Calculate table bounding box and page coverage
+    if cells:
+        x_coords = [cell[0] for cell in cells] + [cell[2] for cell in cells]
+        y_coords = [cell[1] for cell in cells] + [cell[3] for cell in cells]
+        table_x1, table_y1 = min(x_coords), min(y_coords)
+        table_x2, table_y2 = max(x_coords), max(y_coords)
+        table_area = (table_x2 - table_x1) * (table_y2 - table_y1)
+        page_area = page_width * page_height
+
+        coverage_ratio = table_area / page_area if page_area > 0 else 0
+
+        # STRICT: If table covers > 65% of page, it must have at least 3 distinct columns
+        # Real tables covering most of the page need clear column structure
+        if coverage_ratio > 0.65:
+            # Count distinct columns by clustering x-coordinates
+            x_centers = [(cell[0] + cell[2]) / 2 for cell in cells]
+            x_centers_sorted = sorted(set(x_centers))
+
+            # Group x-coordinates within tolerance to count columns
+            distinct_cols = 1
+            if len(x_centers_sorted) > 1:
+                prev_x = x_centers_sorted[0]
+                for x in x_centers_sorted[1:]:
+                    if abs(x - prev_x) > 30:  # 30px tolerance for column grouping
+                        distinct_cols += 1
+                    prev_x = x
+
+            # Reject giant tables without sufficient column structure
+            if distinct_cols < 3:
+                return False
+
+    # STRICT CHECK 3: Row/Col ratio - reject single-column "tables"
+    # Count distinct rows and columns
+    y_centers = [(cell[1] + cell[3]) / 2 for cell in cells]
+    x_centers = [(cell[0] + cell[2]) / 2 for cell in cells]
+
+    # Cluster to find distinct rows
+    y_sorted = sorted(set(y_centers))
+    distinct_rows = 1
+    if len(y_sorted) > 1:
+        prev_y = y_sorted[0]
+        for y in y_sorted[1:]:
+            if abs(y - prev_y) > 20:  # 20px tolerance for row grouping
+                distinct_rows += 1
+            prev_y = y
+
+    # Cluster to find distinct columns
+    x_sorted = sorted(set(x_centers))
+    distinct_cols = 1
+    if len(x_sorted) > 1:
+        prev_x = x_sorted[0]
+        for x in x_sorted[1:]:
+            if abs(x - prev_x) > 30:  # 30px tolerance for column grouping
+                distinct_cols += 1
+            prev_x = x
+
+    # Reject if only 1 column (just rows of text, not a table)
+    if distinct_cols < 2:
+        return False
+
     occupied_cells = set()
 
     for tb in text_blocks:
@@ -128,17 +196,17 @@ def validate_table_structure(cells, text_blocks, occupied_cell_ratio_threshold=0
             # Check how much of the text block is inside the cell
             intersection_area = max(0, min(tb_box[2], cell_box[2]) - max(tb_box[0], cell_box[0])) * \
                                 max(0, min(tb_box[3], cell_box[3]) - max(tb_box[1], cell_box[1]))
-            
+
             if (intersection_area / tb_area) > iou_threshold:
                 occupied_cells.add(i)
                 break # A text block belongs to only one cell
 
     occupied_ratio = len(occupied_cells) / total_cells
-    
+
     # If the occupancy rate of cells is too low, this is probably a form.
     if occupied_ratio < occupied_cell_ratio_threshold:
         return False
-        
+
     return True
 
 def index_cells(cells, axis_tol=10):
@@ -190,9 +258,10 @@ def grid_to_dataframe(grid_map, num_rows, num_cols):
             
     return pd.DataFrame(data)
 
-def find_borderless_table_blocks(text_blocks, min_cols=2, min_rows=2):
+def find_borderless_table_blocks(text_blocks, min_cols=2, min_rows=2, page_width=None, page_height=None):
     """
     Finds a group of blocks forming a table based on text block alignment.
+    Includes safety check to prevent whole-page tables without clear column structure.
     """
     if len(text_blocks) < min_cols * min_rows:
         return []
@@ -248,5 +317,35 @@ def find_borderless_table_blocks(text_blocks, min_cols=2, min_rows=2):
         if len(current_table_blocks) > max_cells and num_rows_in_candidate >= min_rows:
             max_cells = len(current_table_blocks)
             best_table_blocks = current_table_blocks
-            
+
+    # CRITICAL SAFETY CHECK: Prevent whole-page tables without clear column structure
+    if best_table_blocks and page_width and page_height:
+        # Calculate table bounding box
+        all_x = [coord for block in best_table_blocks for coord in [block['bounding_box'][0], block['bounding_box'][2]]]
+        all_y = [coord for block in best_table_blocks for coord in [block['bounding_box'][1], block['bounding_box'][3]]]
+
+        table_x1, table_y1 = min(all_x), min(all_y)
+        table_x2, table_y2 = max(all_x), max(all_y)
+        table_area = (table_x2 - table_x1) * (table_y2 - table_y1)
+        page_area = page_width * page_height
+
+        coverage_ratio = table_area / page_area if page_area > 0 else 0
+
+        # Count distinct columns by clustering x-coordinates
+        x_centers = [utils.bbox_center(block['bounding_box'])[0] for block in best_table_blocks]
+        x_centers_sorted = sorted(set(x_centers))
+
+        distinct_cols = 1
+        if len(x_centers_sorted) > 1:
+            prev_x = x_centers_sorted[0]
+            for x in x_centers_sorted[1:]:
+                if abs(x - prev_x) > 30:  # 30px tolerance for column separation
+                    distinct_cols += 1
+                prev_x = x
+
+        # STRICT: Reject if table covers > 65% of page and has fewer than 3 columns
+        # A real table covering most of the page MUST have multiple columns
+        if coverage_ratio > 0.65 and distinct_cols < 3:
+            return []
+
     return best_table_blocks

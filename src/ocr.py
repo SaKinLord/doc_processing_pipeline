@@ -361,23 +361,32 @@ def ocr_with_trocr(roi_bgr):
     for line_img in line_images:
         if line_img.shape[0] < 5 or line_img.shape[1] < 5:
             continue
-            
+
         rgb_image = cv2.cvtColor(line_img, cv2.COLOR_BGR2RGB)
         try:
             pixel_values = _trocr_processor_instance(images=rgb_image, return_tensors="pt").pixel_values.to("cuda")
-            
-            # Use beam search (num_beams=4) for better accuracy
+
+            # More deterministic generation to reduce hallucinations
             generated_ids = _trocr_model_instance.generate(
                 pixel_values,
                 max_new_tokens=64,
                 num_beams=4,
-                early_stopping=True
+                early_stopping=True,
+                no_repeat_ngram_size=3,
+                temperature=0.1,
+                do_sample=True
             )
             generated_text = _trocr_processor_instance.batch_decode(generated_ids, skip_special_tokens=True)[0]
-            
-            if generated_text.strip():
-                full_text_parts.append(generated_text.strip())
-                
+
+            # Post-processing filter to discard garbage outputs
+            clean_text = generated_text.strip()
+            if clean_text:
+                # Filter out very short non-alphanumeric text (likely hallucinations)
+                has_alphanumeric = any(c.isalnum() for c in clean_text)
+                if len(clean_text) < 2 and not has_alphanumeric:
+                    continue  # Discard this garbage output
+                full_text_parts.append(clean_text)
+
         except Exception as e:
             print(f"    - Error during TrOCR line inference: {e}")
             continue
