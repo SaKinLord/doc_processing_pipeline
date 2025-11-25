@@ -17,22 +17,74 @@ class FigureClassifier:
         if hasattr(self, 'model'):
             return
 
-        print("    - Initializing Figure Classifier (ViT model)...")
         if not torch.cuda.is_available():
             print("    - [WARNING] CUDA not available. Figure classification will be disabled.")
             self.processor = None
             self.model = None
+            self.model_type = None
             return
 
+        # Try CLIP first (better for document figures)
         try:
+            from transformers import CLIPProcessor, CLIPModel
+
+            print("    - Initializing Figure Classifier (CLIP model for zero-shot)...")
+            self.model_type = 'clip'
+            model_id = "openai/clip-vit-base-patch32"
+            self.processor = CLIPProcessor.from_pretrained(model_id)
+            self.model = CLIPModel.from_pretrained(model_id).to("cuda")
+
+            # Define document-specific labels for zero-shot classification
+            self.candidate_labels = [
+                "a bar chart with vertical or horizontal bars",
+                "a line graph showing trends over time",
+                "a pie chart showing percentages",
+                "a scatter plot with data points",
+                "a flowchart or process diagram",
+                "a photograph or image",
+                "a map or geographic visualization",
+                "a table or data grid",
+                "an organizational chart",
+                "a technical diagram or schematic",
+                "a logo or icon",
+                "a signature or handwriting sample",
+            ]
+
+            self.label_to_kind = {
+                "a bar chart with vertical or horizontal bars": "bar_chart",
+                "a line graph showing trends over time": "line_chart",
+                "a pie chart showing percentages": "pie_chart",
+                "a scatter plot with data points": "scatter_plot",
+                "a flowchart or process diagram": "flowchart",
+                "a photograph or image": "photo",
+                "a map or geographic visualization": "map",
+                "a table or data grid": "table_image",
+                "an organizational chart": "org_chart",
+                "a technical diagram or schematic": "diagram",
+                "a logo or icon": "logo",
+                "a signature or handwriting sample": "signature",
+            }
+
+            print("    - ✅ Figure Classifier (CLIP) initialized successfully on GPU.")
+
+        except Exception as e:
+            print(f"    - Failed to load CLIP, falling back to ViT: {e}")
+            self._init_vit_fallback()
+
+    def _init_vit_fallback(self):
+        """Fall back to ViT if CLIP fails."""
+        try:
+            print("    - Initializing Figure Classifier (ViT model)...")
+            self.model_type = 'vit'
             model_id = "google/vit-base-patch16-224"
             self.processor = ViTImageProcessor.from_pretrained(model_id)
             self.model = ViTForImageClassification.from_pretrained(model_id).to("cuda")
-            print("    - ✅ Figure Classifier initialized successfully on GPU.")
+            print("    - ✅ Figure Classifier (ViT) initialized successfully on GPU.")
         except Exception as e:
             print(f"    - [ERROR] Failed to initialize Figure Classifier: {e}")
             self.processor = None
             self.model = None
+            self.model_type = None
 
     def _map_label_to_kind(self, label: str) -> str:
         """
@@ -136,22 +188,42 @@ class FigureClassifier:
         return 'figure'
 
     def classify(self, image_roi) -> str:
-        """Classifies a given image ROI and returns its type."""
+        """Classifies a given image ROI using CLIP (zero-shot) or ViT."""
         if self.model is None or self.processor is None:
             return "figure"
 
         try:
             image_rgb = Image.fromarray(cv2.cvtColor(image_roi, cv2.COLOR_BGR2RGB))
-            
-            inputs = self.processor(images=image_rgb, return_tensors="pt").to("cuda")
-            outputs = self.model(**inputs)
-            logits = outputs.logits
-            
-            predicted_class_idx = logits.argmax(-1).item()
-            predicted_label = self.model.config.id2label[predicted_class_idx]
-            
-            kind = self._map_label_to_kind(predicted_label)
-            return kind
+
+            if self.model_type == 'clip':
+                # Zero-shot classification with CLIP
+                inputs = self.processor(
+                    text=self.candidate_labels,
+                    images=image_rgb,
+                    return_tensors="pt",
+                    padding=True
+                ).to("cuda")
+
+                outputs = self.model(**inputs)
+                logits_per_image = outputs.logits_per_image
+                probs = logits_per_image.softmax(dim=1)
+
+                best_idx = probs.argmax().item()
+                best_label = self.candidate_labels[best_idx]
+
+                return self.label_to_kind.get(best_label, "figure")
+
+            else:  # ViT classification (fallback)
+                inputs = self.processor(images=image_rgb, return_tensors="pt").to("cuda")
+                outputs = self.model(**inputs)
+                logits = outputs.logits
+
+                predicted_class_idx = logits.argmax(-1).item()
+                predicted_label = self.model.config.id2label[predicted_class_idx]
+
+                kind = self._map_label_to_kind(predicted_label)
+                return kind
+
         except Exception as e:
             print(f"    - Error during figure classification: {e}")
             return "figure"

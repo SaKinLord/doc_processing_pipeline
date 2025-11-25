@@ -13,6 +13,7 @@ Uses a combination of:
 import cv2
 import numpy as np
 from scipy import ndimage
+from scipy.signal import find_peaks
 
 
 class HandwritingDetector:
@@ -23,7 +24,7 @@ class HandwritingDetector:
     This is much faster than running multiple OCR engines.
     """
 
-    def __init__(self, confidence_threshold=0.65):
+    def __init__(self, confidence_threshold=0.55):
         """
         Initialize the handwriting detector.
 
@@ -171,6 +172,72 @@ class HandwritingDetector:
 
         return features
 
+    def _extract_stroke_features(self, gray_image):
+        """
+        Extract stroke-specific features that better distinguish handwriting.
+
+        Handwritten text has:
+        - Variable stroke width (irregular pen pressure)
+        - Irregular baseline (letters don't align perfectly)
+        - Variable character spacing and connectivity
+
+        Args:
+            gray_image: Grayscale image
+
+        Returns:
+            dict: Stroke feature metrics
+        """
+        features = {}
+
+        if gray_image.size == 0:
+            return features
+
+        # 1. Stroke width variation using distance transform
+        _, binary = cv2.threshold(gray_image, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        dist_transform = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+
+        if dist_transform.size > 0 and np.any(dist_transform > 0):
+            stroke_widths = dist_transform[dist_transform > 0]
+            features['stroke_width_mean'] = np.mean(stroke_widths)
+            features['stroke_width_std'] = np.std(stroke_widths)
+            # High std = variable stroke width = likely handwriting
+            features['stroke_variation_ratio'] = features['stroke_width_std'] / (features['stroke_width_mean'] + 1e-6)
+        else:
+            features['stroke_width_mean'] = 0
+            features['stroke_width_std'] = 0
+            features['stroke_variation_ratio'] = 0
+
+        # 2. Baseline irregularity
+        # Find text baseline by horizontal projection
+        h_proj = np.sum(binary, axis=1)
+        if len(h_proj) > 10:
+            # Find peaks in projection (text lines)
+            try:
+                peaks, _ = find_peaks(h_proj, height=np.max(h_proj) * 0.3)
+                if len(peaks) > 1:
+                    peak_diffs = np.diff(peaks)
+                    features['baseline_regularity'] = np.std(peak_diffs) / (np.mean(peak_diffs) + 1e-6)
+                else:
+                    features['baseline_regularity'] = 0
+            except:
+                features['baseline_regularity'] = 0
+        else:
+            features['baseline_regularity'] = 0
+
+        # 3. Character connectivity - component analysis
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+        if num_labels > 1:
+            areas = stats[1:, cv2.CC_STAT_AREA]  # Exclude background
+            features['component_count'] = num_labels - 1
+            features['avg_component_area'] = np.mean(areas)
+            features['component_area_variance'] = np.std(areas) / (np.mean(areas) + 1e-6)
+        else:
+            features['component_count'] = 0
+            features['avg_component_area'] = 0
+            features['component_area_variance'] = 0
+
+        return features
+
     def _extract_statistical_features(self, gray_image):
         """
         Extracts statistical features from pixel intensity distribution.
@@ -231,20 +298,44 @@ class HandwritingDetector:
         score = 0.0
         weights_sum = 0.0
 
-        # 1. Stroke width variance (high variance = handwritten)
-        if 'stroke_width_var_ratio' in features:
+        # 1. Stroke variation ratio (NEW - high variance = handwritten)
+        if 'stroke_variation_ratio' in features:
+            svr = features['stroke_variation_ratio']
+            if svr > 0.4:  # High variation = handwriting
+                score += 0.3 * min(svr / 0.8, 1.0)
+            elif svr < 0.2:  # Low variation = printed
+                score -= 0.2
+            weights_sum += 0.3
+        # Fallback to old feature name if new one not present
+        elif 'stroke_width_var_ratio' in features:
             var_ratio = features['stroke_width_var_ratio']
             if var_ratio > 0.5:
-                # Increased weight for stroke width variance
-                score += 0.35 * min(var_ratio / 0.8, 1.0)
+                score += 0.3 * min(var_ratio / 0.8, 1.0)
             else:
                 score -= 0.15
-            weights_sum += 0.35
+            weights_sum += 0.3
 
-        # 2. Component size variance (high variance = handwritten)
-        if 'area_variance' in features and features['num_components'] > 3:
+        # 1b. Baseline irregularity (NEW - irregular baseline = handwriting)
+        if 'baseline_regularity' in features:
+            br = features['baseline_regularity']
+            if br > 0.3:  # Irregular baseline = handwriting
+                score += 0.25 * min(br / 1.0, 1.0)
+            elif br < 0.1:  # Regular baseline = printed
+                score -= 0.15
+            weights_sum += 0.25
+
+        # 2. Component area variance (NEW - high variance = handwritten)
+        if 'component_area_variance' in features:
+            cav = features['component_area_variance']
+            if cav > 0.8:  # Highly variable component sizes = handwriting
+                score += 0.25 * min(cav / 2.0, 1.0)
+            elif cav < 0.3:  # Uniform components = printed
+                score -= 0.15
+            weights_sum += 0.25
+        # Fallback to old feature name
+        elif 'area_variance' in features and features.get('num_components', 0) > 3:
             # Normalize by average area
-            if features['avg_component_area'] > 0:
+            if features.get('avg_component_area', 0) > 0:
                 normalized_var = features['area_variance'] / (features['avg_component_area'] ** 2)
                 if normalized_var > 0.5:
                     score += 0.2 * min(normalized_var / 2.0, 1.0)
@@ -342,8 +433,11 @@ class HandwritingDetector:
 
         stat_features = self._extract_statistical_features(gray)
 
+        # NEW: Extract stroke-specific features for better handwriting detection
+        stroke_features = self._extract_stroke_features(gray)
+
         # Combine all features
-        all_features = {**texture_features, **morph_features, **stat_features}
+        all_features = {**texture_features, **morph_features, **stat_features, **stroke_features}
 
         # Calculate handwriting score
         handwriting_score = self._score_handwriting_likelihood(all_features)

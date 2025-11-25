@@ -30,6 +30,53 @@ try:
 except ImportError:
     CHART_EXTRACTOR_AVAILABLE = False
 
+
+def add_quality_flags(page_result):
+    """
+    Add quality flags to help downstream systems identify uncertain extractions.
+
+    Args:
+        page_result: Page processing result dictionary
+
+    Returns:
+        dict: Page result with quality_flags added
+    """
+    flags = []
+
+    # Count low-confidence text blocks
+    low_conf_blocks = 0
+    total_blocks = 0
+
+    for element in page_result.get('elements', []):
+        if element.get('type') == 'TextBlock':
+            total_blocks += 1
+            conf = element.get('meta', {}).get('ocr_conf', 100)
+            if conf < 50:
+                low_conf_blocks += 1
+
+    if total_blocks > 0:
+        low_conf_ratio = low_conf_blocks / total_blocks
+        if low_conf_ratio > 0.3:
+            flags.append({
+                'type': 'LOW_OCR_CONFIDENCE',
+                'severity': 'warning',
+                'message': f'{low_conf_ratio:.0%} of text blocks have low confidence',
+                'affected_ratio': low_conf_ratio
+            })
+
+    # Check image quality preset
+    quality = page_result.get('metadata', {}).get('image_quality', {})
+    if quality.get('quality_preset') == 'noisy':
+        flags.append({
+            'type': 'NOISY_IMAGE',
+            'severity': 'info',
+            'message': 'Image quality detected as noisy, results may be affected'
+        })
+
+    page_result['quality_flags'] = flags
+    return page_result
+
+
 class DocumentProcessor:
     """
     End-to-end pipeline class for processing a single document page.
@@ -116,8 +163,15 @@ class DocumentProcessor:
 
             base_filename = f"{os.path.splitext(self.file_name)[0]}_p{self.page_num}_{table_id}"
 
+            # Save clean CSV (empty cells for merged regions)
             csv_path = os.path.join(config.TABLES_DIR, f"{base_filename}.csv")
-            result['dataframe'].to_csv(csv_path, index=False, header=False)
+            with open(csv_path, 'w', encoding='utf-8', newline='') as f:
+                f.write(result['csv_clean'])
+
+            # Save flat CSV (repeated content in merged regions) - useful for analysis
+            csv_flat_path = os.path.join(config.TABLES_DIR, f"{base_filename}_flat.csv")
+            with open(csv_flat_path, 'w', encoding='utf-8', newline='') as f:
+                f.write(result['csv_flat'])
 
             html_path = os.path.join(config.TABLES_DIR, f"{base_filename}.html")
             with open(html_path, 'w', encoding='utf-8') as f:
@@ -148,6 +202,7 @@ class DocumentProcessor:
                 'has_merged_cells': has_merged,
                 'export': {
                     'csv_path': csv_path,
+                    'csv_flat_path': csv_flat_path,
                     'html_path': html_path,
                     'markdown_path': md_path
                 },
@@ -157,6 +212,7 @@ class DocumentProcessor:
         except Exception as e:
             print(f"    - Advanced table structure analysis failed: {e}")
             return None
+
 
     def _prepare_image(self):
         print(f"  [1/8] Preparing image for page {self.page_num}...")

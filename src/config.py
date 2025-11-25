@@ -75,6 +75,35 @@ LANG_DETECT_CONFIDENCE_THRESHOLD = 0.98
 TABLE_HOUGH_MIN_LINE_LEN = 80
 TABLE_HOUGH_MAX_LINE_GAP = 10
 
+
+def get_adaptive_line_params(page_width, page_height):
+    """
+    Calculate adaptive Hough line parameters based on page dimensions.
+
+    Args:
+        page_width: Width of the page in pixels
+        page_height: Height of the page in pixels
+
+    Returns:
+        dict: Adaptive line detection parameters
+    """
+    min_dimension = min(page_width, page_height)
+
+    # Minimum line length: 5% of smaller dimension, but at least 40px
+    min_line_length = max(40, int(min_dimension * 0.05))
+
+    # For tables: require lines to be at least 10% of page width
+    table_min_line_length = max(80, int(page_width * 0.10))
+
+    # Line gap tolerance: scale with page size
+    max_line_gap = max(5, int(min_dimension * 0.01))
+
+    return {
+        'min_line_length': min_line_length,
+        'table_min_line_length': table_min_line_length,
+        'max_line_gap': max_line_gap,
+    }
+
 # Pixel tolerance for merging nearby lines
 TABLE_LINE_MERGE_TOLERANCE = 5
 

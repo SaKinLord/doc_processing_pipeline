@@ -431,7 +431,11 @@ def extract_table_with_structure(bgr_image, binary_inv, h_lines, v_lines, ocr_fu
     html_output = structure_to_html(cell_data_map, structure['num_rows'], structure['num_cols'])
     markdown_output = structure_to_markdown(cell_data_map, structure['num_rows'], structure['num_cols'])
 
-    # Also create DataFrame (flattened for merged cells)
+    # Generate clean CSV exports (without merge indicators)
+    csv_clean = structure_to_csv(cell_data_map, structure['num_rows'], structure['num_cols'])
+    csv_flat = structure_to_csv_flat(cell_data_map, structure['num_rows'], structure['num_cols'])
+
+    # Also create DataFrame (flattened for merged cells) - kept for backwards compatibility
     df = _create_dataframe_with_merges(cell_data_map, structure['num_rows'], structure['num_cols'])
 
     return {
@@ -441,7 +445,9 @@ def extract_table_with_structure(bgr_image, binary_inv, h_lines, v_lines, ocr_fu
         'merged_cells': structure['merged_cells'],
         'html': html_output,
         'markdown': markdown_output,
-        'dataframe': df
+        'csv_clean': csv_clean,  # CSV with empty cells for merged regions
+        'csv_flat': csv_flat,    # CSV with repeated content in merged regions
+        'dataframe': df          # DataFrame (kept for backwards compatibility)
     }
 
 
@@ -467,3 +473,88 @@ def _create_dataframe_with_merges(cell_data_map, num_rows, num_cols):
                     covered.add((r, c))
 
     return pd.DataFrame(data)
+
+
+def structure_to_csv(cell_data_map, num_rows, num_cols):
+    """
+    Converts structured table data to CSV with actual cell content.
+    Merged cells show content in the top-left cell, empty in spanned cells.
+
+    Args:
+        cell_data_map: Dictionary mapping (row, col) to cell information
+        num_rows: Number of rows in the table
+        num_cols: Number of columns in the table
+
+    Returns:
+        CSV string with actual text content (no merge indicators)
+    """
+    import csv
+    import io
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+
+    # Track which cells are covered by spans
+    covered = set()
+
+    for row in range(num_rows):
+        row_data = []
+
+        for col in range(num_cols):
+            if (row, col) in covered:
+                row_data.append("")  # Empty for spanned cells
+                continue
+
+            cell_info = cell_data_map.get((row, col), {})
+            text = cell_info.get('text', '').strip()
+            rowspan = cell_info.get('rowspan', 1)
+            colspan = cell_info.get('colspan', 1)
+
+            # Mark covered cells
+            for r in range(row, row + rowspan):
+                for c in range(col, col + colspan):
+                    if (r, c) != (row, col):
+                        covered.add((r, c))
+
+            row_data.append(text)
+
+        writer.writerow(row_data)
+
+    return output.getvalue()
+
+
+def structure_to_csv_flat(cell_data_map, num_rows, num_cols):
+    """
+    CSV export where merged cells repeat their content in all spanned positions.
+    Better for downstream analysis tools that don't understand cell merges.
+
+    Args:
+        cell_data_map: Dictionary mapping (row, col) to cell information
+        num_rows: Number of rows in the table
+        num_cols: Number of columns in the table
+
+    Returns:
+        CSV string with repeated content in merged cells
+    """
+    import csv
+    import io
+
+    # First, build a flat grid
+    flat_grid = [["" for _ in range(num_cols)] for _ in range(num_rows)]
+
+    for (row, col), cell_info in cell_data_map.items():
+        text = cell_info.get('text', '').strip()
+        rowspan = cell_info.get('rowspan', 1)
+        colspan = cell_info.get('colspan', 1)
+
+        # Fill all cells in the span with the same content
+        for r in range(row, min(row + rowspan, num_rows)):
+            for c in range(col, min(col + colspan, num_cols)):
+                flat_grid[r][c] = text
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    for row_data in flat_grid:
+        writer.writerow(row_data)
+
+    return output.getvalue()

@@ -85,6 +85,134 @@ def _initialize_trocr():
             _trocr_model_instance = None
 
 
+# =============================================================================
+# OCR RETRY WITH PREPROCESSING STRATEGIES
+# =============================================================================
+
+def enhance_contrast(image):
+    """
+    CLAHE-based contrast enhancement for low-contrast images.
+
+    Args:
+        image: BGR image
+
+    Returns:
+        Enhanced BGR image
+    """
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    l = clahe.apply(l)
+    return cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+
+
+def sharpen_image(image):
+    """
+    Unsharp masking for sharpening blurry images.
+
+    Args:
+        image: BGR image
+
+    Returns:
+        Sharpened BGR image
+    """
+    gaussian = cv2.GaussianBlur(image, (0, 0), 3)
+    return cv2.addWeighted(image, 1.5, gaussian, -0.5, 0)
+
+
+def morphology_clean(image):
+    """
+    Clean noise with morphological operations.
+
+    Args:
+        image: BGR image
+
+    Returns:
+        Cleaned BGR image
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    cleaned = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel)
+    return cv2.cvtColor(cleaned, cv2.COLOR_GRAY2BGR)
+
+
+def scale_image_2x(image):
+    """
+    2x upscaling with cubic interpolation for small text.
+
+    Args:
+        image: BGR image
+
+    Returns:
+        Scaled BGR image
+    """
+    return cv2.resize(image, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+
+
+def ocr_with_retry(original_bgr, binary_image, box, lang, min_confidence=50.0):
+    """
+    Attempts OCR with multiple preprocessing strategies if confidence is low.
+
+    This function tries different preprocessing approaches to improve OCR results
+    when the initial attempt yields low confidence scores.
+
+    Args:
+        original_bgr: Original BGR image
+        binary_image: Binary preprocessed image
+        box: Bounding box (x1, y1, x2, y2)
+        lang: Language code for Tesseract
+        min_confidence: Minimum acceptable confidence score
+
+    Returns:
+        tuple: (best_text, best_confidence)
+    """
+    # Define preprocessing strategies
+    strategies = [
+        ("original", lambda img: img),
+        ("contrast_enhanced", enhance_contrast),
+        ("sharpened", sharpen_image),
+        ("scaled_2x", scale_image_2x),
+        ("morphology_cleaned", morphology_clean),
+    ]
+
+    best_result = ("", 0.0)
+
+    for strategy_name, preprocess_fn in strategies:
+        try:
+            # Apply preprocessing
+            processed = preprocess_fn(original_bgr)
+
+            # Convert to grayscale and binarize
+            if len(processed.shape) == 3:
+                gray = cv2.cvtColor(processed, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = processed
+
+            # Apply adaptive thresholding
+            binary = cv2.adaptiveThreshold(
+                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY, 45, 15
+            )
+
+            # Run Tesseract OCR
+            text, conf = ocr_with_tesseract(original_bgr, binary, box, lang)
+
+            # Update best result if this is better
+            if conf > best_result[1]:
+                best_result = (text, conf)
+                # print(f"    - Strategy '{strategy_name}' improved confidence to {conf:.1f}")
+
+            # Stop if we've reached acceptable confidence
+            if conf >= min_confidence:
+                return text, conf
+
+        except Exception as e:
+            # print(f"    - Strategy '{strategy_name}' failed: {e}")
+            continue
+
+    return best_result
+
+
 def _clean_text(text):
     """Cleans excess whitespace and OCR-related noise from text."""
     if not isinstance(text, str):
@@ -269,8 +397,8 @@ def ocr_routed(original_bgr_image, binary_image, box, lang=DEFAULT_OCR_LANG):
     text_type, detection_confidence = _detect_text_type(roi_original)
 
     # Step 2: Route to appropriate OCR engine
-    if text_type == 'handwritten' and detection_confidence > 0.55:
-        # Lower threshold to catch more handwriting
+    if text_type == 'handwritten' and detection_confidence > 0.50:
+        # Lowered threshold from 0.55 to 0.50 to align with new detector (0.55 threshold)
         print(f"    - Text classified as HANDWRITTEN (conf: {detection_confidence:.2f}). Routing to TrOCR...")
 
         # ADAPTIVE: Use special preprocessing for handwriting (soft denoising, no binarization)
@@ -362,29 +490,32 @@ def ocr_with_trocr(roi_bgr):
         if line_img.shape[0] < 5 or line_img.shape[1] < 5:
             continue
 
+        # Resize if too small (TrOCR works better with larger images)
+        h, w = line_img.shape[:2]
+        if h < 32:
+            scale = 32 / h
+            line_img = cv2.resize(line_img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
         rgb_image = cv2.cvtColor(line_img, cv2.COLOR_BGR2RGB)
         try:
             pixel_values = _trocr_processor_instance(images=rgb_image, return_tensors="pt").pixel_values.to("cuda")
 
-            # More deterministic generation to reduce hallucinations
+            # FIXED: Fully deterministic generation to eliminate hallucinations
             generated_ids = _trocr_model_instance.generate(
                 pixel_values,
-                max_new_tokens=64,
-                num_beams=4,
+                max_new_tokens=128,          # Increased from 64 for longer lines
+                num_beams=5,                 # Increased from 4 for better search
                 early_stopping=True,
                 no_repeat_ngram_size=3,
-                temperature=0.1,
-                do_sample=True
+                do_sample=False,             # CRITICAL: Disable sampling for determinism
+                length_penalty=1.0,          # NEW: Neutral length penalty
+                repetition_penalty=1.2       # NEW: Penalize repetition
             )
             generated_text = _trocr_processor_instance.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
-            # Post-processing filter to discard garbage outputs
+            # Enhanced filtering using validation function
             clean_text = generated_text.strip()
-            if clean_text:
-                # Filter out very short non-alphanumeric text (likely hallucinations)
-                has_alphanumeric = any(c.isalnum() for c in clean_text)
-                if len(clean_text) < 2 and not has_alphanumeric:
-                    continue  # Discard this garbage output
+            if clean_text and is_valid_ocr_output(clean_text):
                 full_text_parts.append(clean_text)
 
         except Exception as e:
@@ -392,6 +523,157 @@ def ocr_with_trocr(roi_bgr):
             continue
 
     return _clean_text(" ".join(full_text_parts))
+
+
+def is_valid_ocr_output(text):
+    """
+    Validates OCR output to filter hallucinations and garbage.
+
+    Args:
+        text: The OCR output text to validate
+
+    Returns:
+        bool: True if text appears valid, False if it's likely garbage/hallucination
+    """
+    import re
+
+    if not text or len(text.strip()) == 0:
+        return False
+
+    text = text.strip()
+
+    # 1. Check for repetitive patterns (hallucination indicator)
+    if len(text) > 5:
+        for pattern_len in range(2, min(6, len(text) // 2)):
+            pattern = text[:pattern_len]
+            repetitions = text.count(pattern)
+            # If pattern repeats too many times, likely hallucination
+            if repetitions > len(text) / pattern_len * 0.6:
+                return False
+
+    # 2. Check alphanumeric ratio (should have at least 30% alphanumeric characters)
+    alnum_count = sum(1 for c in text if c.isalnum())
+    if len(text) > 3 and alnum_count / len(text) < 0.3:
+        return False
+
+    # 3. Check for known garbage patterns
+    garbage_patterns = [
+        r'^[.,:;!?]+$',           # Only punctuation
+        r'^[-_=+]+$',             # Only symbols
+        r'(.)\1{4,}',             # 5+ repeated characters (e.g., "aaaaa")
+        r'^[A-Z]{15,}$',          # 15+ uppercase letters (likely noise)
+    ]
+
+    for pattern in garbage_patterns:
+        if re.match(pattern, text):
+            return False
+
+    return True
+
+
+# =============================================================================
+# OCR ENSEMBLE WITH WEIGHTED VOTING
+# =============================================================================
+
+def texts_are_similar(text1, text2, threshold=0.7):
+    """
+    Check if two texts are similar using character-level similarity.
+
+    Args:
+        text1: First text string
+        text2: Second text string
+        threshold: Similarity threshold (0-1)
+
+    Returns:
+        bool: True if texts are similar
+    """
+    if not text1 or not text2:
+        return False
+
+    # Simple Jaccard similarity on character bigrams
+    def get_bigrams(text):
+        text = text.lower().replace(' ', '')
+        return set(text[i:i+2] for i in range(len(text) - 1))
+
+    b1, b2 = get_bigrams(text1), get_bigrams(text2)
+    if not b1 or not b2:
+        return text1.lower() == text2.lower()
+
+    intersection = len(b1 & b2)
+    union = len(b1 | b2)
+
+    return intersection / union >= threshold if union > 0 else False
+
+
+def ocr_ensemble(original_bgr, binary_image, box, lang='eng'):
+    """
+    Run multiple OCR engines and combine results using weighted voting.
+
+    This improves accuracy by leveraging the strengths of different OCR engines.
+
+    Args:
+        original_bgr: Original BGR image
+        binary_image: Binary preprocessed image
+        box: Bounding box (x1, y1, x2, y2)
+        lang: Language code
+
+    Returns:
+        tuple: (best_text, best_confidence)
+    """
+    results = []
+
+    # 1. Tesseract OCR
+    try:
+        tess_text, tess_conf = ocr_with_tesseract(binary_image, lang=lang, box=box)
+        if tess_text.strip():
+            quality = _calculate_text_quality_score(tess_text, tess_conf)
+            results.append({
+                'text': tess_text,
+                'confidence': tess_conf,
+                'quality': quality,
+                'engine': 'tesseract',
+                'weight': 0.4 if tess_conf > 70 else 0.2
+            })
+    except Exception as e:
+        # print(f"    - Tesseract failed in ensemble: {e}")
+        pass
+
+    # 2. PaddleOCR
+    try:
+        paddle_text = ocr_with_paddle(original_bgr)
+        if paddle_text.strip():
+            # PaddleOCR doesn't return confidence, estimate from quality
+            quality = _calculate_text_quality_score(paddle_text, 75.0)
+            results.append({
+                'text': paddle_text,
+                'confidence': 75.0,
+                'quality': quality,
+                'engine': 'paddleocr',
+                'weight': 0.35
+            })
+    except Exception as e:
+        # print(f"    - PaddleOCR failed in ensemble: {e}")
+        pass
+
+    # Return best result or empty
+    if not results:
+        return "", 0.0
+
+    if len(results) == 1:
+        return results[0]['text'], results[0]['confidence']
+
+    # Use weighted voting - pick the one with highest weighted quality
+    best = max(results, key=lambda r: r['quality'] * r['weight'])
+
+    # Log disagreements for debugging
+    if len(results) > 1:
+        texts = [r['text'] for r in results]
+        if not texts_are_similar(texts[0], texts[1]):
+            # print(f"    - OCR disagreement: {[r['engine'] + ':' + r['text'][:30] for r in results]}")
+            pass
+
+    return best['text'], best['confidence']
+
 
 def ocr_smart(original_bgr_image, binary_image, box, lang=DEFAULT_OCR_LANG):
     """
@@ -404,11 +686,21 @@ def ocr_smart(original_bgr_image, binary_image, box, lang=DEFAULT_OCR_LANG):
     x2, y2 = min(w, x2), min(h, y2)
     
     roi_binary = binary_image[y1:y2, x1:x2]
+    roi_original = original_bgr_image[y1:y2, x1:x2]
+
     if roi_binary.size == 0:
         return "", 0.0
 
-    # --- Stage 1: Tesseract ---
+    # --- Stage 1: Tesseract with retry on low confidence ---
     tess_text, tess_conf = ocr_with_tesseract(roi_binary, lang=lang, box=box)
+
+    # If confidence is low, try with preprocessing strategies
+    if tess_conf < 50.0:
+        retry_text, retry_conf = ocr_with_retry(roi_original, roi_binary, box, lang, min_confidence=50.0)
+        if retry_conf > tess_conf:
+            tess_text, tess_conf = retry_text, retry_conf
+            # print(f"    - Retry improved confidence from {tess_conf:.1f} to {retry_conf:.1f}")
+
     tess_quality = _calculate_text_quality_score(tess_text, tess_conf)
 
     # Check if result is good enough
@@ -418,8 +710,6 @@ def ocr_smart(original_bgr_image, binary_image, box, lang=DEFAULT_OCR_LANG):
     best_text = tess_text
     best_conf = tess_conf
     best_quality = tess_quality
-
-    roi_original = original_bgr_image[y1:y2, x1:x2]
 
     # Suspicion check
     is_fragmented = _is_likely_handwritten(tess_text, tess_conf)

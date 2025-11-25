@@ -349,3 +349,81 @@ def find_borderless_table_blocks(text_blocks, min_cols=2, min_rows=2, page_width
             return []
 
     return best_table_blocks
+
+
+def detect_borderless_table_advanced(text_blocks, page_width, page_height):
+    """
+    Advanced borderless table detection using DBSCAN clustering.
+
+    Args:
+        text_blocks: List of text block dictionaries with 'bounding_box' keys
+        page_width: Width of the page
+        page_height: Height of the page
+
+    Returns:
+        dict or None: Table structure with grid info, or None if no table detected
+    """
+    if len(text_blocks) < 4:
+        return None
+
+    try:
+        from sklearn.cluster import DBSCAN
+        import numpy as np
+    except ImportError:
+        # Fall back to basic method if sklearn not available
+        return None
+
+    # Extract bounding boxes
+    boxes = [block['bounding_box'] for block in text_blocks]
+
+    # Calculate centers
+    centers_x = [(b[0] + b[2]) / 2 for b in boxes]
+    centers_y = [(b[1] + b[3]) / 2 for b in boxes]
+
+    # Cluster x-coordinates to find columns
+    x_array = np.array(centers_x).reshape(-1, 1)
+    col_clustering = DBSCAN(eps=30, min_samples=2).fit(x_array)
+
+    col_labels = col_clustering.labels_
+    n_columns = len(set(col_labels)) - (1 if -1 in col_labels else 0)
+
+    if n_columns < 2:
+        return None  # Not enough columns for a table
+
+    # Cluster y-coordinates to find rows
+    y_array = np.array(centers_y).reshape(-1, 1)
+    row_clustering = DBSCAN(eps=25, min_samples=2).fit(y_array)
+
+    row_labels = row_clustering.labels_
+    n_rows = len(set(row_labels)) - (1 if -1 in row_labels else 0)
+
+    if n_rows < 2:
+        return None  # Not enough rows for a table
+
+    # Build grid and check alignment quality
+    grid = {}
+    for i, block in enumerate(text_blocks):
+        if col_labels[i] == -1 or row_labels[i] == -1:
+            continue  # Skip outliers
+
+        cell_key = (row_labels[i], col_labels[i])
+        if cell_key not in grid:
+            grid[cell_key] = []
+        grid[cell_key].append(block)
+
+    # Calculate grid occupancy
+    expected_cells = n_rows * n_columns
+    occupied_cells = len(grid)
+    occupancy_ratio = occupied_cells / expected_cells if expected_cells > 0 else 0
+
+    # A good table should have reasonable occupancy (>40%)
+    if occupancy_ratio < 0.4:
+        return None
+
+    return {
+        'type': 'borderless_table',
+        'n_rows': n_rows,
+        'n_columns': n_columns,
+        'grid': grid,
+        'occupancy_ratio': occupancy_ratio
+    }

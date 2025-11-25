@@ -62,9 +62,104 @@ def deskew(gray_image):
 
     return deskewed
 
+
+def estimate_skew_angle(gray_image, max_angle=15):
+    """
+    Estimate document skew angle using Hough transform.
+
+    Args:
+        gray_image: Grayscale image
+        max_angle: Maximum expected skew angle in degrees
+
+    Returns:
+        float: Estimated skew angle in degrees
+    """
+    try:
+        edges = cv2.Canny(gray_image, 50, 150, apertureSize=3)
+        lines = cv2.HoughLines(edges, 1, np.pi / 180, 200)
+
+        if lines is None:
+            return 0.0
+
+        angles = []
+        for line in lines:
+            rho, theta = line[0]
+            angle_deg = np.degrees(theta) - 90
+            if abs(angle_deg) < max_angle:
+                angles.append(angle_deg)
+
+        if not angles:
+            return 0.0
+
+        # Use median to be robust to outliers
+        return np.median(angles)
+    except:
+        return 0.0
+
+
+def get_preprocessing_params(quality_metrics):
+    """
+    Select preprocessing parameters based on comprehensive quality analysis.
+
+    Args:
+        quality_metrics: Dictionary of quality metrics from analyze_image_quality()
+
+    Returns:
+        dict: Preprocessing parameters
+    """
+    params = {
+        'denoising_h': 5,
+        'clahe_clip_limit': 2.0,
+        'clahe_grid_size': (8, 8),
+        'sharpen': False,
+        'deskew': False,
+        'contrast_enhance': False,
+        'binarization_method': 'adaptive',  # 'adaptive', 'otsu', or 'sauvola'
+    }
+
+    lap_var = quality_metrics.get('laplacian_variance', 1000)
+    brightness = quality_metrics.get('brightness', 128)
+    contrast = quality_metrics.get('contrast', 50)
+    noise = quality_metrics.get('noise_estimate', 5)
+    skew = quality_metrics.get('skew_angle', 0)
+    text_density = quality_metrics.get('text_density', 0.1)
+
+    # Noise-based denoising
+    if noise > 15:
+        params['denoising_h'] = min(10, int(noise / 2))  # Scale with noise
+    elif noise < 5:
+        params['denoising_h'] = 0  # Skip denoising for clean images
+
+    # Blurry images (low laplacian variance)
+    if lap_var < 100:
+        params['sharpen'] = True
+        params['binarization_method'] = 'sauvola'  # Better for low contrast
+
+    # Low contrast images
+    if contrast < 40:
+        params['clahe_clip_limit'] = 3.0
+        params['contrast_enhance'] = True
+
+    # Very bright or very dark images
+    if brightness > 220 or brightness < 50:
+        params['clahe_clip_limit'] = 2.5
+        params['contrast_enhance'] = True
+
+    # Skewed images
+    if abs(skew) > 0.5:
+        params['deskew'] = True
+
+    # Dense text (forms, tables) - use finer grid
+    if text_density > 0.3:
+        params['clahe_grid_size'] = (4, 4)
+
+    return params
+
+
 def analyze_image_quality(bgr_image):
     """
     Analyzes image quality to determine optimal preprocessing parameters.
+    Enhanced with additional metrics for better adaptive preprocessing.
     """
     gray = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2GRAY)
 
@@ -75,6 +170,21 @@ def analyze_image_quality(bgr_image):
     # Calculate brightness and contrast
     brightness = np.mean(gray)
     contrast = np.std(gray)
+
+    # NEW: Noise estimation using median filter difference
+    median_filtered = cv2.medianBlur(gray, 5)
+    noise_estimate = np.mean(np.abs(gray.astype(float) - median_filtered.astype(float)))
+
+    # NEW: Skew angle estimation
+    skew_angle = estimate_skew_angle(gray)
+
+    # NEW: Text density (ratio of foreground pixels after thresholding)
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    text_density = np.sum(binary > 0) / binary.size
+
+    # NEW: Local contrast variation (for detecting faded regions)
+    local_std = cv2.blur(gray.astype(float) ** 2, (50, 50)) - cv2.blur(gray.astype(float), (50, 50)) ** 2
+    local_contrast_uniformity = np.std(np.sqrt(np.maximum(local_std, 0)))
 
     # Determine quality preset based on metrics
     quality_preset = 'normal'
@@ -110,6 +220,10 @@ def analyze_image_quality(bgr_image):
         'laplacian_variance': float(laplacian_var),
         'brightness': float(brightness),
         'contrast': float(contrast),
+        'noise_estimate': float(noise_estimate),
+        'skew_angle': float(skew_angle),
+        'text_density': float(text_density),
+        'local_contrast_uniformity': float(local_contrast_uniformity),
         'quality_preset': quality_preset,
         'denoising_h': denoising_h,
         'clahe_clip_limit': clahe_clip_limit
