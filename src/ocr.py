@@ -5,8 +5,9 @@ import cv2
 import torch
 import pytesseract
 import numpy as np
-from .config import DEFAULT_OCR_LANG, LOW_CONFIDENCE_THRESHOLD
+from .config import DEFAULT_OCR_LANG, LOW_CONFIDENCE_THRESHOLD, ENABLE_TEXT_POSTPROCESSING
 from . import image_utils  # NEW: Import image_utils for adaptive preprocessing
+from . import text_postprocessing  # NEW: Import text post-processing module
 
 # --- PaddleOCR Integration ---
 try:
@@ -740,5 +741,15 @@ def ocr_smart(original_bgr_image, binary_image, box, lang=DEFAULT_OCR_LANG):
     
     if best_quality < 20.0:
         return "", 0.0
+
+    # Apply text post-processing corrections (if enabled)
+    if ENABLE_TEXT_POSTPROCESSING:
+        # Language-aware corrections: only apply letter corrections to Western languages
+        if lang in ['eng', 'fra', 'deu', 'spa', 'por', 'ita']:
+            # Apply full corrections (letter substitutions + spacing)
+            best_text = text_postprocessing.apply_text_corrections(best_text)
+        else:
+            # For other languages, only fix spacing issues (safer)
+            best_text = text_postprocessing.fix_spacing_issues(best_text)
 
     return best_text, best_conf

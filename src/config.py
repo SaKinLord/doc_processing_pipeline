@@ -133,3 +133,11 @@ USE_OCR_ROUTING = True
 # Minimum confidence for handwriting detection to trigger direct routing
 # Below this threshold, falls back to smart OCR (fallback chain)
 HANDWRITING_DETECTION_THRESHOLD = 0.7
+
+# =============================================================================
+#  TEXT POST-PROCESSING SETTINGS
+# =============================================================================
+# Enable automatic text corrections for OCR output
+# When True, applies corrections for common OCR errors and spacing issues
+# When False, returns raw OCR text without post-processing
+ENABLE_TEXT_POSTPROCESSING = True
