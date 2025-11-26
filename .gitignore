@@ -5,7 +5,8 @@ venv/
 .venv/
 venv311/
 .claude
-doc_pipeline_improvements
+implementation_review.md
+doc_pipeline_improvements.md
 
 # Python cache files
 __pycache__/
