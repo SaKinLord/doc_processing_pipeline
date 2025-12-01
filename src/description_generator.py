@@ -1,7 +1,7 @@
 # src/description_generator.py
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, BitsAndBytesConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 import pandas as pd
 from difflib import SequenceMatcher
 
@@ -26,28 +26,18 @@ class DescriptionGenerator:
             self.pipe = None
             return
 
+        torch.random.manual_seed(0)
+        model_id = "microsoft/Phi-3-mini-4k-instruct"
+        
+        # Try loading with quantization first, fall back to float16 if it fails
+        model = self._load_model_with_fallback(model_id)
+        
+        if model is None:
+            self.pipe = None
+            return
+        
         try:
-            torch.random.manual_seed(0)
-            model_id = "microsoft/Phi-3-mini-4k-instruct"
-
-            # 4-bit Quantization Settings
-            quantization_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_compute_dtype=torch.bfloat16,
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_quant_type="nf4",
-            )
-
-            # Load model to GPU in 4-bit
-            model = AutoModelForCausalLM.from_pretrained(
-                model_id,
-                device_map="cuda",
-                torch_dtype="auto",
-                trust_remote_code=True,
-                quantization_config=quantization_config
-            )
             tokenizer = AutoTokenizer.from_pretrained(model_id)
-
             self.pipe = pipeline(
                 "text-generation",
                 model=model,
@@ -55,9 +45,72 @@ class DescriptionGenerator:
             )
             print("  - ✅ Description Generator initialized successfully on GPU.")
         except Exception as e:
-            print(f"  - [ERROR] Failed to initialize Description Generator: {e}")
+            print(f"  - [ERROR] Failed to create pipeline: {e}")
             print("  - Natural language descriptions will be disabled.")
             self.pipe = None
+
+    def _load_model_with_fallback(self, model_id: str):
+        """
+        Load model with quantization fallback.
+        
+        Tries 4-bit quantization first (saves VRAM), falls back to float16 if 
+        bitsandbytes/triton compatibility issues occur.
+        """
+        # Attempt 1: Try 4-bit quantization (requires compatible triton + bitsandbytes)
+        try:
+            from transformers import BitsAndBytesConfig
+            
+            print("  - Attempting 4-bit quantization...")
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+            )
+            
+            model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                device_map="cuda",
+                torch_dtype="auto",
+                trust_remote_code=True,
+                quantization_config=quantization_config
+            )
+            print("  - ✅ Loaded with 4-bit quantization (memory efficient)")
+            return model
+            
+        except Exception as e:
+            print(f"  - ⚠️ 4-bit quantization failed: {e}")
+            print("  - Falling back to float16 (uses more VRAM but compatible)...")
+        
+        # Attempt 2: Fall back to float16 (no quantization)
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                device_map="cuda",
+                torch_dtype=torch.float16,
+                trust_remote_code=True,
+            )
+            print("  - ✅ Loaded with float16 (no quantization)")
+            return model
+            
+        except Exception as e:
+            print(f"  - [ERROR] float16 loading also failed: {e}")
+        
+        # Attempt 3: Try bfloat16 as last resort
+        try:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                device_map="cuda",
+                torch_dtype=torch.bfloat16,
+                trust_remote_code=True,
+            )
+            print("  - ✅ Loaded with bfloat16")
+            return model
+            
+        except Exception as e:
+            print(f"  - [ERROR] All loading methods failed: {e}")
+            print("  - Natural language descriptions will be disabled.")
+            return None
 
     def _generate_text(self, prompt, max_length=100):
         if not self.pipe:

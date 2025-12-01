@@ -1,33 +1,107 @@
 # GPU PyTorch installation (CUDA 12.1)
 --extra-index-url https://download.pytorch.org/whl/cu121
 
+# =============================================================================
 # Core Libraries
+# =============================================================================
 numpy==1.26.4
 pandas==2.2.2
 Pillow==10.3.0
 tqdm==4.66.4
-opencv-python-headless==4.10.0.84
 
+# =============================================================================
+# 🆕 Image Processing & Super-Resolution (Feature 1)
+# =============================================================================
+# opencv-contrib-python includes the DNN Super Resolution module
+# Required for EDSR, ESPCN, FSRCNN, and LapSRN models
+opencv-contrib-python==4.10.0.84
+
+# =============================================================================
 # OCR and Language Detection
+# =============================================================================
 pytesseract==0.3.10
 langdetect==1.0.9
 paddlepaddle==2.6.2
 paddleocr==2.8.1
 
+# =============================================================================
+# 🆕 Surya OCR Integration (Feature 2)
+# =============================================================================
+# Surya OCR for superior text line detection in complex layouts
+# Requires PyTorch and Hugging Face Transformers
+surya-ocr==0.6.0
+
+# =============================================================================
 # PDF Processing
+# =============================================================================
 pdf2image==1.17.0
 
+# =============================================================================
 # Layout Analysis
+# =============================================================================
 scikit-learn==1.5.0
 layoutparser==0.3.4
 
+# =============================================================================
 # PyTorch (GPU - CUDA 12.1 version)
+# =============================================================================
 torch==2.3.1
 torchvision==0.18.1
 torchaudio==2.3.1
 
+# =============================================================================
 # LLM & TrOCR Libraries
+# =============================================================================
 transformers==4.41.2
 accelerate==0.31.0
 bitsandbytes==0.43.1
 sentencepiece==0.2.0
+
+# =============================================================================
+# 🆕 Vision-Language Model Dependencies (Feature 3)
+# =============================================================================
+# Qwen-VL-Chat and LLaVA support
+# These models require transformers>=4.40.0 (already satisfied above)
+# Additional dependencies for multimodal models
+tiktoken>=0.5.0
+einops>=0.7.0
+
+# =============================================================================
+# 🆕 Fuzzy Matching Libraries (Feature 4)
+# =============================================================================
+# SymSpell - Fast spelling correction using symmetric delete algorithm
+# Significantly faster than traditional Levenshtein-based approaches
+symspellpy==6.7.7
+
+# thefuzz - Python port of SeatGeek's fuzzywuzzy for fuzzy string matching
+# Used as fallback when SymSpell is not available
+thefuzz[speedup]==0.22.1
+
+# python-Levenshtein - Fast implementation of Levenshtein distance
+# Speeds up thefuzz by 4-10x
+python-Levenshtein==0.25.1
+
+# =============================================================================
+# Optional: Enhanced Dictionary
+# =============================================================================
+# nltk for WordNet dictionary (optional, for expanded vocabulary)
+# Uncomment if you need more comprehensive word coverage
+# nltk==3.8.1
+
+# =============================================================================
+# Utility Libraries
+# =============================================================================
+# Requests for downloading super-resolution models
+requests>=2.31.0
+
+# PyYAML for configuration files (optional)
+pyyaml>=6.0
+
+# =============================================================================
+# Development Dependencies (optional)
+# =============================================================================
+# pytest>=7.4.0
+# pytest-cov>=4.1.0
+# black>=23.9.0
+# flake8>=6.1.0
+# mypy>=1.5.0

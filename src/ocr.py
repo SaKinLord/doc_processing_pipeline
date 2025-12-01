@@ -5,9 +5,25 @@ import cv2
 import torch
 import pytesseract
 import numpy as np
-from .config import DEFAULT_OCR_LANG, LOW_CONFIDENCE_THRESHOLD, ENABLE_TEXT_POSTPROCESSING
-from . import image_utils  # NEW: Import image_utils for adaptive preprocessing
-from . import text_postprocessing  # NEW: Import text post-processing module
+
+try:
+    from .config import (
+        DEFAULT_OCR_LANG, LOW_CONFIDENCE_THRESHOLD, ENABLE_TEXT_POSTPROCESSING,
+        USE_SURYA_OCR, SURYA_COMPLEXITY_THRESHOLD, SURYA_MIN_LINE_FALLBACK,
+        SURYA_LINE_DETECTION_ONLY, SURYA_CONFIDENCE_THRESHOLD,
+        USE_FUZZY_MATCHING
+    )
+    from . import image_utils
+    from . import text_postprocessing
+except ImportError:
+    from config import (
+        DEFAULT_OCR_LANG, LOW_CONFIDENCE_THRESHOLD, ENABLE_TEXT_POSTPROCESSING,
+        USE_SURYA_OCR, SURYA_COMPLEXITY_THRESHOLD, SURYA_MIN_LINE_FALLBACK,
+        SURYA_LINE_DETECTION_ONLY, SURYA_CONFIDENCE_THRESHOLD,
+        USE_FUZZY_MATCHING
+    )
+    import image_utils
+    import text_postprocessing
 
 # --- PaddleOCR Integration ---
 try:
@@ -35,6 +51,319 @@ except ImportError:
     _handwriting_detector_available = False
     print("Warning: handwriting_detector module not available. Smart OCR routing will use heuristics only.")
 
+# =============================================================================
+#  🆕 SURYA OCR INTEGRATION (Feature 2)
+# =============================================================================
+_surya_predictor = None
+_surya_det_processor = None
+_surya_rec_model = None
+_surya_det_model = None
+SURYA_AVAILABLE = False
+SURYA_OCR_API_VERSION = None
+
+# Surya function references
+_surya_batch_text_detection = None
+_surya_load_det_model = None
+_surya_load_det_processor = None
+_surya_load_rec_model = None
+_surya_load_rec_processor = None
+
+def _check_surya_ocr_availability():
+    """
+    Check if Surya OCR is available.
+    
+    Surya 0.6.0 API:
+    - surya.detection.batch_text_detection(images, model, processor)
+    - surya.model.detection.model.load_model()
+    - surya.model.detection.model.load_processor()  # NOTE: In model module!
+    - surya.model.recognition.model.load_model()
+    - surya.model.recognition.processor.load_processor()
+    """
+    global SURYA_AVAILABLE, SURYA_OCR_API_VERSION
+    global _surya_batch_text_detection
+    global _surya_load_det_model, _surya_load_det_processor
+    global _surya_load_rec_model, _surya_load_rec_processor
+    
+    try:
+        # Import detection function
+        from surya.detection import batch_text_detection
+        _surya_batch_text_detection = batch_text_detection
+        print("    - ✅ Found surya.detection.batch_text_detection")
+        
+        # Import detection model and processor loaders
+        # NOTE: In surya 0.6.0, load_processor is in the MODEL module!
+        from surya.model.detection.model import load_model as load_det_model
+        from surya.model.detection.model import load_processor as load_det_processor
+        _surya_load_det_model = load_det_model
+        _surya_load_det_processor = load_det_processor
+        print("    - ✅ Found detection load_model and load_processor")
+        
+        # Import recognition model and processor loaders (optional)
+        try:
+            from surya.model.recognition.model import load_model as load_rec_model
+            from surya.model.recognition.processor import load_processor as load_rec_processor
+            _surya_load_rec_model = load_rec_model
+            _surya_load_rec_processor = load_rec_processor
+            print("    - ✅ Found recognition load_model and load_processor")
+        except ImportError:
+            print("    - ⚠️ Recognition models not available (detection-only mode)")
+        
+        SURYA_AVAILABLE = True
+        SURYA_OCR_API_VERSION = 'v0.6'
+        print("    - ✅ Surya OCR available (v0.6.0 API)")
+        return True
+        
+    except ImportError as e:
+        print(f"    - ❌ Surya import error: {e}")
+        SURYA_AVAILABLE = False
+        return False
+    except Exception as e:
+        print(f"    - ❌ Surya error: {type(e).__name__}: {e}")
+        SURYA_AVAILABLE = False
+        return False
+
+# Run availability check at module load
+_check_surya_ocr_availability()
+
+
+def _initialize_surya():
+    """Initialize Surya OCR models (lazy loading)."""
+    global _surya_det_model, _surya_det_processor, _surya_rec_model, _surya_predictor
+    
+    if not SURYA_AVAILABLE or not USE_SURYA_OCR:
+        return False
+    
+    if _surya_det_model is not None:
+        return True
+    
+    try:
+        print("    - Initializing Surya OCR models...")
+        
+        # Load detection model and processor
+        _surya_det_model = _surya_load_det_model()
+        _surya_det_processor = _surya_load_det_processor()
+        print("    - ✅ Detection model loaded")
+        
+        # Load recognition model if available and not line-detection-only
+        if not SURYA_LINE_DETECTION_ONLY and _surya_load_rec_model is not None:
+            try:
+                _surya_rec_model = _surya_load_rec_model()
+                _surya_predictor = _surya_load_rec_processor()
+                print("    - ✅ Recognition model loaded")
+            except Exception as e:
+                print(f"    - ⚠️ Recognition model not loaded: {e}")
+        
+        print("    - ✅ Surya OCR initialized successfully")
+        return True
+        
+    except Exception as e:
+        print(f"    - ⚠️ Failed to initialize Surya OCR: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def ocr_with_surya(image_bgr, langs=None):
+    """
+    Run Surya OCR on the given image.
+    
+    Args:
+        image_bgr: BGR image (numpy array)
+        langs: List of language codes (default: ['en'])
+    
+    Returns:
+        tuple: (text, confidence, line_bboxes)
+    """
+    if not SURYA_AVAILABLE or not USE_SURYA_OCR:
+        return "", 0.0, []
+    
+    if not _initialize_surya():
+        return "", 0.0, []
+    
+    if langs is None:
+        langs = ['en']
+    
+    try:
+        from PIL import Image
+        rgb_image = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(rgb_image)
+        
+        # Run detection: batch_text_detection(images, model, processor)
+        predictions = _surya_batch_text_detection(
+            [pil_image],
+            _surya_det_model,
+            _surya_det_processor
+        )
+        
+        if not predictions or len(predictions) == 0:
+            return "", 0.0, []
+        
+        # Extract results
+        result = predictions[0]
+        text_lines = []
+        confidences = []
+        line_bboxes = []
+        
+        for text_line in result.text_lines:
+            if hasattr(text_line, 'text') and text_line.text:
+                text_lines.append(text_line.text)
+                
+                if hasattr(text_line, 'confidence'):
+                    confidences.append(text_line.confidence)
+                else:
+                    confidences.append(0.85)  # Default confidence
+                
+                if hasattr(text_line, 'bbox'):
+                    line_bboxes.append(text_line.bbox)
+        
+        full_text = " ".join(text_lines)
+        avg_confidence = sum(confidences) / len(confidences) if confidences else 0.0
+        
+        return full_text, avg_confidence * 100, line_bboxes
+        
+    except Exception as e:
+        print(f"    - Surya OCR error: {e}")
+        return "", 0.0, []
+
+
+def get_surya_line_detections(image_bgr):
+    """
+    Use Surya for line detection only.
+    
+    Args:
+        image_bgr: BGR image (numpy array)
+    
+    Returns:
+        list: List of line bounding boxes [(x1, y1, x2, y2), ...]
+    """
+    if not SURYA_AVAILABLE or not USE_SURYA_OCR:
+        return []
+    
+    if not _initialize_surya():
+        return []
+    
+    try:
+        from PIL import Image
+        
+        rgb_image = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(rgb_image)
+        
+        # Run detection: batch_text_detection(images, model, processor)
+        predictions = _surya_batch_text_detection(
+            [pil_image],
+            _surya_det_model,
+            _surya_det_processor
+        )
+        
+        if not predictions or len(predictions) == 0:
+            return []
+        
+        result = predictions[0]
+        line_bboxes = []
+        
+        # Extract bboxes from result
+        detection_items = []
+        if hasattr(result, 'bboxes'):
+            detection_items = result.bboxes
+        elif hasattr(result, 'text_lines'):
+            detection_items = result.text_lines
+        elif isinstance(result, list):
+            detection_items = result
+        
+        for text_line in detection_items:
+            bbox = None
+            if hasattr(text_line, 'bbox'):
+                bbox = text_line.bbox
+            elif hasattr(text_line, 'polygon'):
+                poly = text_line.polygon
+                if poly and len(poly) >= 4:
+                    xs = [p[0] for p in poly]
+                    ys = [p[1] for p in poly]
+                    bbox = [min(xs), min(ys), max(xs), max(ys)]
+            elif isinstance(text_line, (list, tuple)) and len(text_line) >= 4:
+                bbox = text_line[:4]
+            
+            if bbox and len(bbox) >= 4:
+                line_bboxes.append([int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])])
+        
+        return line_bboxes
+        
+    except Exception as e:
+        print(f"    - Surya line detection error: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
+
+# Helper functions for extracting Surya results (kept for compatibility)
+def _extract_surya_items(result):
+    """Extract detection items from Surya result."""
+    for attr in ['bboxes', 'text_lines', 'lines', 'detections', 'boxes']:
+        if hasattr(result, attr):
+            return getattr(result, attr)
+    if isinstance(result, dict):
+        for key in ['bboxes', 'text_lines', 'lines', 'detections', 'boxes']:
+            if key in result:
+                return result[key]
+    if isinstance(result, list):
+        return result
+    return []
+
+
+def _extract_surya_bbox(text_line):
+    """Extract bounding box from Surya detection item."""
+    if hasattr(text_line, 'bbox'):
+        return text_line.bbox
+    if hasattr(text_line, 'bounding_box'):
+        return text_line.bounding_box
+    if isinstance(text_line, dict):
+        return text_line.get('bbox') or text_line.get('bounding_box')
+    if isinstance(text_line, (list, tuple)) and len(text_line) >= 4:
+        try:
+            [float(x) for x in text_line[:4]]
+            return text_line[:4]
+        except:
+            pass
+    if hasattr(text_line, 'polygon'):
+        poly = text_line.polygon
+        if poly and len(poly) >= 4:
+            xs = [p[0] for p in poly]
+            ys = [p[1] for p in poly]
+            return [min(xs), min(ys), max(xs), max(ys)]
+    return None
+
+
+def is_complex_layout(quality_metrics, text_blocks_count=0):
+    """
+    Determine if the document has a complex layout that benefits from Surya.
+    
+    Args:
+        quality_metrics: Image quality analysis dictionary
+        text_blocks_count: Number of text blocks detected by primary OCR
+    
+    Returns:
+        bool: True if layout is complex
+    """
+    # High text density suggests complex form or dense document
+    text_density = quality_metrics.get('text_density', 0.1)
+    if text_density > SURYA_COMPLEXITY_THRESHOLD:
+        return True
+    
+    # Very few lines detected might indicate missed content
+    if text_blocks_count < SURYA_MIN_LINE_FALLBACK:
+        return True
+    
+    # Low local contrast uniformity suggests mixed regions
+    local_uniformity = quality_metrics.get('local_contrast_uniformity', 30)
+    if local_uniformity > 40:  # High variance = complex layout
+        return True
+    
+    return False
+
+
+# =============================================================================
+#  EXISTING OCR FUNCTIONS (with Surya integration points)
+# =============================================================================
 
 def _initialize_paddle():
     """Initializes PaddleOCR only when first called."""
@@ -52,10 +381,11 @@ def _initialize_paddle():
         pass
     
     # Fall back to on-demand initialization
-    if _paddle_ocr_instance is None and 'paddleocr' in globals():
+    if _paddle_ocr_instance is None and 'PaddleOCR' in dir():
         print("    - Initializing PaddleOCR for the first time...")
         _paddle_ocr_instance = PaddleOCR(use_angle_cls=True, lang='latin', show_log=False)
         print("    - PaddleOCR initialized.")
+
 
 def _initialize_trocr():
     """Initializes TrOCR model and processor only when first called."""
@@ -73,7 +403,7 @@ def _initialize_trocr():
         pass
     
     # Fall back to on-demand initialization
-    if _trocr_processor_instance is None and 'TrOCRProcessor' in globals() and torch.cuda.is_available():
+    if _trocr_processor_instance is None and 'TrOCRProcessor' in dir() and torch.cuda.is_available():
         try:
             print("    - Initializing TrOCR model for handwriting (this may take a moment)...")
             model_id = "microsoft/trocr-base-handwritten"
@@ -91,15 +421,7 @@ def _initialize_trocr():
 # =============================================================================
 
 def enhance_contrast(image):
-    """
-    CLAHE-based contrast enhancement for low-contrast images.
-
-    Args:
-        image: BGR image
-
-    Returns:
-        Enhanced BGR image
-    """
+    """CLAHE-based contrast enhancement for low-contrast images."""
     lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
@@ -108,29 +430,13 @@ def enhance_contrast(image):
 
 
 def sharpen_image(image):
-    """
-    Unsharp masking for sharpening blurry images.
-
-    Args:
-        image: BGR image
-
-    Returns:
-        Sharpened BGR image
-    """
+    """Unsharp masking for sharpening blurry images."""
     gaussian = cv2.GaussianBlur(image, (0, 0), 3)
     return cv2.addWeighted(image, 1.5, gaussian, -0.5, 0)
 
 
 def morphology_clean(image):
-    """
-    Clean noise with morphological operations.
-
-    Args:
-        image: BGR image
-
-    Returns:
-        Cleaned BGR image
-    """
+    """Clean noise with morphological operations."""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
     cleaned = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel)
@@ -138,36 +444,12 @@ def morphology_clean(image):
 
 
 def scale_image_2x(image):
-    """
-    2x upscaling with cubic interpolation for small text.
-
-    Args:
-        image: BGR image
-
-    Returns:
-        Scaled BGR image
-    """
+    """2x upscaling with cubic interpolation for small text."""
     return cv2.resize(image, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
 
 
 def ocr_with_retry(original_bgr, binary_image, box, lang, min_confidence=50.0):
-    """
-    Attempts OCR with multiple preprocessing strategies if confidence is low.
-
-    This function tries different preprocessing approaches to improve OCR results
-    when the initial attempt yields low confidence scores.
-
-    Args:
-        original_bgr: Original BGR image
-        binary_image: Binary preprocessed image
-        box: Bounding box (x1, y1, x2, y2)
-        lang: Language code for Tesseract
-        min_confidence: Minimum acceptable confidence score
-
-    Returns:
-        tuple: (best_text, best_confidence)
-    """
-    # Define preprocessing strategies
+    """Attempts OCR with multiple preprocessing strategies if confidence is low."""
     strategies = [
         ("original", lambda img: img),
         ("contrast_enhanced", enhance_contrast),
@@ -180,35 +462,27 @@ def ocr_with_retry(original_bgr, binary_image, box, lang, min_confidence=50.0):
 
     for strategy_name, preprocess_fn in strategies:
         try:
-            # Apply preprocessing
             processed = preprocess_fn(original_bgr)
 
-            # Convert to grayscale and binarize
             if len(processed.shape) == 3:
                 gray = cv2.cvtColor(processed, cv2.COLOR_BGR2GRAY)
             else:
                 gray = processed
 
-            # Apply adaptive thresholding
             binary = cv2.adaptiveThreshold(
                 gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                 cv2.THRESH_BINARY, 45, 15
             )
 
-            # Run Tesseract OCR
-            text, conf = ocr_with_tesseract(original_bgr, binary, box, lang)
+            text, conf = ocr_with_tesseract(processed, binary, box, lang)
 
-            # Update best result if this is better
             if conf > best_result[1]:
                 best_result = (text, conf)
-                # print(f"    - Strategy '{strategy_name}' improved confidence to {conf:.1f}")
 
-            # Stop if we've reached acceptable confidence
             if conf >= min_confidence:
                 return text, conf
 
-        except Exception as e:
-            # print(f"    - Strategy '{strategy_name}' failed: {e}")
+        except Exception:
             continue
 
     return best_result
@@ -220,92 +494,69 @@ def _clean_text(text):
         return ""
     return re.sub(r'\s+', ' ', text).strip()
 
+
 def split_text_block_into_lines(image_bgr):
-    """
-    Splits a text block into separate lines using horizontal projection profiles.
-    Critical for TrOCR which expects single-line images.
-    """
+    """Splits a text block into separate lines using horizontal projection profiles."""
     if image_bgr is None or image_bgr.size == 0:
         return []
 
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    # Use Otsu to find text pixels (foreground)
     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     
-    # Calculate horizontal projection (sum of pixels along rows)
-    proj = np.sum(binary, axis=1)
+    h_projection = np.sum(binary, axis=1)
+    threshold = np.max(h_projection) * 0.1
     
-    height, width = gray.shape
-    lines = []
-    start_idx = None
+    in_line = False
+    line_start = 0
+    line_regions = []
     
-    # Dynamic threshold based on mean pixel density to filter noise
-    threshold = np.mean(proj) * 0.1 
+    for i, val in enumerate(h_projection):
+        if not in_line and val > threshold:
+            in_line = True
+            line_start = i
+        elif in_line and val <= threshold:
+            in_line = False
+            if i - line_start > 5:
+                line_regions.append((line_start, i))
     
-    for i in range(height):
-        if proj[i] > threshold and start_idx is None:
-            start_idx = i
-        elif proj[i] <= threshold and start_idx is not None:
-            # Line ended
-            # Ignore noise lines smaller than 8px vertical height
-            if (i - start_idx) > 8: 
-                # Add padding (5px top/bottom)
-                y1 = max(0, start_idx - 5)
-                y2 = min(height, i + 5)
-                # Extract line
-                line_crop = image_bgr[y1:y2, :]
-                lines.append(line_crop)
-            start_idx = None
-            
-    # If projection didn't separate lines (e.g., single line or very noisy), return original
-    if not lines:
-        return [image_bgr]
-        
-    return lines
+    if in_line:
+        line_regions.append((line_start, len(h_projection)))
+    
+    line_images = []
+    for start, end in line_regions:
+        padding = 3
+        start = max(0, start - padding)
+        end = min(image_bgr.shape[0], end + padding)
+        line_img = image_bgr[start:end, :]
+        if line_img.shape[0] > 5 and line_img.shape[1] > 5:
+            line_images.append(line_img)
+    
+    return line_images
 
 
-def _calculate_text_quality_score(text, confidence=0.0):
-    """
-    Calculates a quality score for OCR text based on multiple heuristics.
-    Returns a score from 0-100.
-    """
-    if not text or not isinstance(text, str):
-        return 0.0
-
-    text = text.strip()
-    if len(text) == 0:
+def _calculate_text_quality_score(text, confidence):
+    """Calculates a quality score based on text characteristics and OCR confidence."""
+    if not text or len(text.strip()) == 0:
         return 0.0
 
     score = 0.0
+    score += confidence * 0.4
 
-    # 1. Confidence contribution (0-30 points)
-    score += min(30.0, confidence * 0.3)
-
-    # 2. Length contribution (0-15 points)
-    length_score = min(15.0, len(text) / 10.0)
-    score += length_score
-
-    # 3. Dictionary check (0-20 points)
-    common_words = {
-        'the', 'and', 'is', 'in', 'to', 'of', 'it', 'for', 'on', 'with', 'as', 'at', 'by',
-        've', 'ile', 'bir', 'bu', 'da', 'de', 'için', 'çok', 'ama', 'gibi', 'var', 'yok',
-        'total', 'date', 'invoice', 'amount', 'tax', 'tarih', 'toplam', 'fatura', 'kdv'
-    }
-    words = text.lower().split()
-    if any(w in common_words for w in words):
-        score += 20.0
-
-    # 4. Fragmentation penalty
+    words = text.split()
     if len(words) > 0:
-        avg_word_length = len(text.replace(' ', '')) / len(words)
-        if avg_word_length >= 4.0:
-            score += 25.0
-        elif avg_word_length >= 3.0:
-            score += 15.0
-        elif avg_word_length >= 2.0:
-            score += 5.0
+        single_char_words = sum(1 for w in words if len(w) == 1)
+        word_ratio = 1.0 - (single_char_words / len(words))
+        score += word_ratio * 20.0
 
-    # 5. Character composition
+    valid_words = sum(1 for w in words if len(w) >= 2 and any(c.isalpha() for c in w))
+    if len(words) > 0:
+        score += (valid_words / len(words)) * 20.0
+
+    if len(text) > 10:
+        special_chars = sum(1 for c in text if not c.isalnum() and c not in ' .,;:!?-\'\"')
+        special_ratio = special_chars / len(text)
+        score += max(0, (1.0 - special_ratio * 5)) * 10.0
+
     if len(text) > 0:
         alnum_count = sum(1 for c in text if c.isalnum() or c.isspace())
         alnum_ratio = alnum_count / len(text)
@@ -315,9 +566,7 @@ def _calculate_text_quality_score(text, confidence=0.0):
 
 
 def _is_likely_handwritten(text, confidence):
-    """
-    Heuristic to determine if text is likely handwritten based on OCR results.
-    """
+    """Heuristic to determine if text is likely handwritten based on OCR results."""
     if not text or len(text.strip()) == 0:
         return False
 
@@ -327,16 +576,13 @@ def _is_likely_handwritten(text, confidence):
 
     avg_word_length = len(text.replace(' ', '')) / len(words)
 
-    # Highly fragmented with low confidence
     if avg_word_length < 2.5 and confidence < 70.0:
         return True
 
-    # Many single-character "words"
     single_chars = sum(1 for w in words if len(w) == 1)
     if len(words) > 2 and single_chars / len(words) > 0.35:
         return True
     
-    # Check for specific noise patterns
     if re.search(r'\b[li1I]\s+[li1I]\s+[li1I]\b', text):
         return True
 
@@ -349,16 +595,14 @@ def _get_psm_for_box(box):
     w, h = max(1.0, x2 - x1), max(1.0, y2 - y1)
     aspect_ratio = w / h
     if aspect_ratio > 5.0:
-        return 7 # Single line
+        return 7
     if w * h < 8000:
-        return 13 # Raw line
-    return 6 # Block
+        return 13
+    return 6
 
 
 def _detect_text_type(roi_image):
-    """
-    Uses the handwriting detector to classify text as printed or handwritten.
-    """
+    """Uses the handwriting detector to classify text as printed or handwritten."""
     if not _handwriting_detector_available:
         return 'unknown', 0.0
 
@@ -371,20 +615,19 @@ def _detect_text_type(roi_image):
         return 'unknown', 0.0
 
 
-def ocr_routed(original_bgr_image, binary_image, box, lang=DEFAULT_OCR_LANG):
+def ocr_routed(original_bgr_image, binary_image, box, lang=DEFAULT_OCR_LANG, quality_metrics=None, sr_applied=False):
     """
     Routes OCR to the most appropriate engine based on text type detection.
     
-    Includes ADAPTIVE PROCESSING: Uses specific image preprocessing for handwriting.
+    🆕 Enhanced with Surya OCR for complex layouts.
+    🆕 PERFORMANCE FIX: Added sr_applied flag to skip redundant SR on handwriting regions.
     """
     x1, y1, x2, y2 = map(int, box)
     
-    # Coordinate safety
     h, w = binary_image.shape[:2]
     x1, y1 = max(0, x1), max(0, y1)
     x2, y2 = min(w, x2), min(h, y2)
     
-    # Valid box check
     if x2 <= x1 or y2 <= y1:
         return "", 0.0
 
@@ -394,42 +637,47 @@ def ocr_routed(original_bgr_image, binary_image, box, lang=DEFAULT_OCR_LANG):
     if roi_original.size == 0:
         return "", 0.0
 
-    # Step 1: Detect text type using handwriting detector on ORIGINAL ROI
+    # Step 1: Detect text type
     text_type, detection_confidence = _detect_text_type(roi_original)
 
     # Step 2: Route to appropriate OCR engine
     if text_type == 'handwritten' and detection_confidence > 0.50:
-        # Lowered threshold from 0.55 to 0.50 to align with new detector (0.55 threshold)
-        print(f"    - Text classified as HANDWRITTEN (conf: {detection_confidence:.2f}). Routing to TrOCR...")
+        print(f"      - Region classified as handwritten (conf: {detection_confidence:.2f})")
+        
+        # 🆕 Pass sr_applied flag to skip redundant SR
+        handwriting_ready_img = image_utils.preprocess_for_handwriting(
+            roi_original, 
+            quality_metrics=None,  # Don't pass metrics if SR already applied
+            full_image_sr_applied=sr_applied
+        )
 
-        # ADAPTIVE: Use special preprocessing for handwriting (soft denoising, no binarization)
-        handwriting_ready_img = image_utils.preprocess_for_handwriting(roi_original)
-
-        if 'TrOCRProcessor' in globals():
+        if _trocr_processor_instance is not None or 'TrOCRProcessor' in dir():
             trocr_text = ocr_with_trocr(handwriting_ready_img)
             if trocr_text and len(trocr_text.strip()) > 0:
-                # Assume high confidence for TrOCR if text is found
                 return trocr_text, 85.0
 
-        # Fallback to PaddleOCR
-        if 'paddleocr' in globals():
+        if _paddle_ocr_instance is not None or 'PaddleOCR' in dir():
             paddle_text = ocr_with_paddle(handwriting_ready_img)
             if paddle_text and len(paddle_text.strip()) > 0:
                 return paddle_text, 75.0
 
-        # Last resort: Tesseract
         return ocr_with_tesseract(roi_binary, lang=lang, box=box)
 
     elif text_type == 'printed' and detection_confidence > 0.6:
-        # Printed text -> Use Tesseract on binary image (standard pipeline)
+        # 🆕 Try Surya first for complex layouts
+        if USE_SURYA_OCR and quality_metrics and is_complex_layout(quality_metrics):
+            print("    - Complex layout detected. Trying Surya OCR...")
+            surya_text, surya_conf, _ = ocr_with_surya(roi_original)
+            if surya_text and surya_conf > SURYA_CONFIDENCE_THRESHOLD * 100:
+                return surya_text, surya_conf
+        
         tess_text, tess_conf = ocr_with_tesseract(roi_binary, lang=lang, box=box)
         quality = _calculate_text_quality_score(tess_text, tess_conf)
 
         if quality > 60.0:
             return tess_text, tess_conf
 
-        # If Tesseract quality is poor, try PaddleOCR on original image
-        if quality < 50.0 and 'paddleocr' in globals():
+        if quality < 50.0 and (_paddle_ocr_instance is not None or 'PaddleOCR' in dir()):
             paddle_text = ocr_with_paddle(roi_original)
             if paddle_text:
                 paddle_quality = _calculate_text_quality_score(paddle_text, 75.0)
@@ -439,8 +687,7 @@ def ocr_routed(original_bgr_image, binary_image, box, lang=DEFAULT_OCR_LANG):
         return tess_text, tess_conf
 
     else:
-        # Uncertain classification -> Fall back to smart OCR
-        return ocr_smart(original_bgr_image, binary_image, box, lang)
+        return ocr_smart(original_bgr_image, binary_image, box, lang, quality_metrics, sr_applied)
 
 
 def ocr_with_tesseract(roi_bgr, lang=DEFAULT_OCR_LANG, psm=None, box=None):
@@ -454,36 +701,37 @@ def ocr_with_tesseract(roi_bgr, lang=DEFAULT_OCR_LANG, psm=None, box=None):
         data = pytesseract.image_to_data(roi_bgr, lang=lang, config=config, output_type=pytesseract.Output.DATAFRAME)
     except pytesseract.TesseractNotFoundError:
         return "", 0.0
-    if data is None or data.empty: return "", 0.0
+    if data is None or data.empty:
+        return "", 0.0
     data.dropna(subset=['text'], inplace=True)
     data = data[data.conf != -1]
     text = " ".join([str(t) for t in data['text'].tolist() if str(t).strip()])
     confidence = float(data['conf'].mean()) if not data.empty else 0.0
     return _clean_text(text), confidence
 
+
 def ocr_with_paddle(roi_bgr):
     """Runs PaddleOCR on the given ROI."""
     _initialize_paddle()
-    if _paddle_ocr_instance is None: return ""
+    if _paddle_ocr_instance is None:
+        return ""
     rgb_image = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2RGB)
     try:
         result = _paddle_ocr_instance.ocr(rgb_image, cls=True)
-        if not result or not result[0]: return ""
+        if not result or not result[0]:
+            return ""
         texts = [line[1][0] for line in result[0] if line and len(line) > 1]
         return _clean_text(" ".join(texts))
     except Exception:
         return ""
 
+
 def ocr_with_trocr(roi_bgr):
-    """
-    Runs TrOCR model on the given ROI with LINE SEGMENTATION.
-    """
+    """Runs TrOCR model on the given ROI with LINE SEGMENTATION."""
     _initialize_trocr()
     if _trocr_model_instance is None or _trocr_processor_instance is None:
         return ""
     
-    # 1. SPLIT BLOCK INTO LINES
-    # This prevents the "gibberish" output when TrOCR tries to read multiple lines at once
     line_images = split_text_block_into_lines(roi_bgr)
     full_text_parts = []
     
@@ -491,7 +739,6 @@ def ocr_with_trocr(roi_bgr):
         if line_img.shape[0] < 5 or line_img.shape[1] < 5:
             continue
 
-        # Resize if too small (TrOCR works better with larger images)
         h, w = line_img.shape[:2]
         if h < 32:
             scale = 32 / h
@@ -501,20 +748,18 @@ def ocr_with_trocr(roi_bgr):
         try:
             pixel_values = _trocr_processor_instance(images=rgb_image, return_tensors="pt").pixel_values.to("cuda")
 
-            # FIXED: Fully deterministic generation to eliminate hallucinations
             generated_ids = _trocr_model_instance.generate(
                 pixel_values,
-                max_new_tokens=128,          # Increased from 64 for longer lines
-                num_beams=5,                 # Increased from 4 for better search
+                max_new_tokens=128,
+                num_beams=5,
                 early_stopping=True,
                 no_repeat_ngram_size=3,
-                do_sample=False,             # CRITICAL: Disable sampling for determinism
-                length_penalty=1.0,          # NEW: Neutral length penalty
-                repetition_penalty=1.2       # NEW: Penalize repetition
+                do_sample=False,
+                length_penalty=1.0,
+                repetition_penalty=1.2
             )
             generated_text = _trocr_processor_instance.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
-            # Enhanced filtering using validation function
             clean_text = generated_text.strip()
             if clean_text and is_valid_ocr_output(clean_text):
                 full_text_parts.append(clean_text)
@@ -527,42 +772,28 @@ def ocr_with_trocr(roi_bgr):
 
 
 def is_valid_ocr_output(text):
-    """
-    Validates OCR output to filter hallucinations and garbage.
-
-    Args:
-        text: The OCR output text to validate
-
-    Returns:
-        bool: True if text appears valid, False if it's likely garbage/hallucination
-    """
-    import re
-
+    """Validates OCR output to filter hallucinations and garbage."""
     if not text or len(text.strip()) == 0:
         return False
 
     text = text.strip()
 
-    # 1. Check for repetitive patterns (hallucination indicator)
     if len(text) > 5:
         for pattern_len in range(2, min(6, len(text) // 2)):
             pattern = text[:pattern_len]
             repetitions = text.count(pattern)
-            # If pattern repeats too many times, likely hallucination
             if repetitions > len(text) / pattern_len * 0.6:
                 return False
 
-    # 2. Check alphanumeric ratio (should have at least 30% alphanumeric characters)
     alnum_count = sum(1 for c in text if c.isalnum())
     if len(text) > 3 and alnum_count / len(text) < 0.3:
         return False
 
-    # 3. Check for known garbage patterns
     garbage_patterns = [
-        r'^[.,:;!?]+$',           # Only punctuation
-        r'^[-_=+]+$',             # Only symbols
-        r'(.)\1{4,}',             # 5+ repeated characters (e.g., "aaaaa")
-        r'^[A-Z]{15,}$',          # 15+ uppercase letters (likely noise)
+        r'^[.,:;!?]+$',
+        r'^[-_=+]+$',
+        r'(.)\1{4,}',
+        r'^[A-Z]{15,}$',
     ]
 
     for pattern in garbage_patterns:
@@ -572,26 +803,11 @@ def is_valid_ocr_output(text):
     return True
 
 
-# =============================================================================
-# OCR ENSEMBLE WITH WEIGHTED VOTING
-# =============================================================================
-
 def texts_are_similar(text1, text2, threshold=0.7):
-    """
-    Check if two texts are similar using character-level similarity.
-
-    Args:
-        text1: First text string
-        text2: Second text string
-        threshold: Similarity threshold (0-1)
-
-    Returns:
-        bool: True if texts are similar
-    """
+    """Check if two texts are similar using character-level similarity."""
     if not text1 or not text2:
         return False
 
-    # Simple Jaccard similarity on character bigrams
     def get_bigrams(text):
         text = text.lower().replace(' ', '')
         return set(text[i:i+2] for i in range(len(text) - 1))
@@ -607,23 +823,9 @@ def texts_are_similar(text1, text2, threshold=0.7):
 
 
 def ocr_ensemble(original_bgr, binary_image, box, lang='eng'):
-    """
-    Run multiple OCR engines and combine results using weighted voting.
-
-    This improves accuracy by leveraging the strengths of different OCR engines.
-
-    Args:
-        original_bgr: Original BGR image
-        binary_image: Binary preprocessed image
-        box: Bounding box (x1, y1, x2, y2)
-        lang: Language code
-
-    Returns:
-        tuple: (best_text, best_confidence)
-    """
+    """Run multiple OCR engines and combine results using weighted voting."""
     results = []
 
-    # 1. Tesseract OCR
     try:
         tess_text, tess_conf = ocr_with_tesseract(binary_image, lang=lang, box=box)
         if tess_text.strip():
@@ -635,15 +837,12 @@ def ocr_ensemble(original_bgr, binary_image, box, lang='eng'):
                 'engine': 'tesseract',
                 'weight': 0.4 if tess_conf > 70 else 0.2
             })
-    except Exception as e:
-        # print(f"    - Tesseract failed in ensemble: {e}")
+    except Exception:
         pass
 
-    # 2. PaddleOCR
     try:
         paddle_text = ocr_with_paddle(original_bgr)
         if paddle_text.strip():
-            # PaddleOCR doesn't return confidence, estimate from quality
             quality = _calculate_text_quality_score(paddle_text, 75.0)
             results.append({
                 'text': paddle_text,
@@ -652,33 +851,42 @@ def ocr_ensemble(original_bgr, binary_image, box, lang='eng'):
                 'engine': 'paddleocr',
                 'weight': 0.35
             })
-    except Exception as e:
-        # print(f"    - PaddleOCR failed in ensemble: {e}")
+    except Exception:
         pass
 
-    # Return best result or empty
+    # 🆕 Add Surya to ensemble if available
+    if USE_SURYA_OCR and SURYA_AVAILABLE:
+        try:
+            surya_text, surya_conf, _ = ocr_with_surya(original_bgr)
+            if surya_text.strip():
+                quality = _calculate_text_quality_score(surya_text, surya_conf)
+                results.append({
+                    'text': surya_text,
+                    'confidence': surya_conf,
+                    'quality': quality,
+                    'engine': 'surya',
+                    'weight': 0.4
+                })
+        except Exception:
+            pass
+
     if not results:
         return "", 0.0
 
     if len(results) == 1:
         return results[0]['text'], results[0]['confidence']
 
-    # Use weighted voting - pick the one with highest weighted quality
     best = max(results, key=lambda r: r['quality'] * r['weight'])
-
-    # Log disagreements for debugging
-    if len(results) > 1:
-        texts = [r['text'] for r in results]
-        if not texts_are_similar(texts[0], texts[1]):
-            # print(f"    - OCR disagreement: {[r['engine'] + ':' + r['text'][:30] for r in results]}")
-            pass
-
     return best['text'], best['confidence']
 
 
-def ocr_smart(original_bgr_image, binary_image, box, lang=DEFAULT_OCR_LANG):
+def ocr_smart(original_bgr_image, binary_image, box, lang=DEFAULT_OCR_LANG, quality_metrics=None, sr_applied=False):
     """
-    Applies 3-stage smart OCR: Tesseract -> PaddleOCR -> TrOCR.
+    Applies multi-stage smart OCR with Surya integration.
+    
+    Pipeline: Tesseract -> Surya (if complex) -> PaddleOCR -> TrOCR
+    
+    🆕 PERFORMANCE FIX: Added sr_applied flag to skip redundant SR on handwriting regions.
     """
     x1, y1, x2, y2 = map(int, box)
     
@@ -692,32 +900,39 @@ def ocr_smart(original_bgr_image, binary_image, box, lang=DEFAULT_OCR_LANG):
     if roi_binary.size == 0:
         return "", 0.0
 
-    # --- Stage 1: Tesseract with retry on low confidence ---
+    # --- Stage 1: Tesseract ---
     tess_text, tess_conf = ocr_with_tesseract(roi_binary, lang=lang, box=box)
 
-    # If confidence is low, try with preprocessing strategies
     if tess_conf < 50.0:
         retry_text, retry_conf = ocr_with_retry(roi_original, roi_binary, box, lang, min_confidence=50.0)
         if retry_conf > tess_conf:
             tess_text, tess_conf = retry_text, retry_conf
-            # print(f"    - Retry improved confidence from {tess_conf:.1f} to {retry_conf:.1f}")
 
     tess_quality = _calculate_text_quality_score(tess_text, tess_conf)
 
-    # Check if result is good enough
     if tess_quality > 80.0:
-        return tess_text, tess_conf
+        return _apply_post_processing(tess_text, lang)
 
     best_text = tess_text
     best_conf = tess_conf
     best_quality = tess_quality
 
-    # Suspicion check
-    is_fragmented = _is_likely_handwritten(tess_text, tess_conf)
-    should_try_alternatives = (tess_conf < 60.0 or tess_quality < 50.0 or is_fragmented)
+    # --- Stage 1.5: 🆕 Surya for complex layouts ---
+    if USE_SURYA_OCR and SURYA_AVAILABLE and best_quality < 60.0:
+        surya_text, surya_conf, _ = ocr_with_surya(roi_original)
+        if surya_text:
+            surya_quality = _calculate_text_quality_score(surya_text, surya_conf)
+            if surya_quality > best_quality + 10:
+                best_text = surya_text
+                best_conf = surya_conf
+                best_quality = surya_quality
+                print(f"    - Surya improved quality: {tess_quality:.1f} -> {surya_quality:.1f}")
+
+    is_fragmented = _is_likely_handwritten(best_text, best_conf)
+    should_try_alternatives = (best_conf < 60.0 or best_quality < 50.0 or is_fragmented)
 
     # --- Stage 2: PaddleOCR ---
-    if should_try_alternatives and 'paddleocr' in globals():
+    if should_try_alternatives and (_paddle_ocr_instance is not None or 'PaddleOCR' in dir()):
         paddle_text = ocr_with_paddle(roi_original)
         if paddle_text:
             paddle_quality = _calculate_text_quality_score(paddle_text, 75.0)
@@ -729,9 +944,13 @@ def ocr_smart(original_bgr_image, binary_image, box, lang=DEFAULT_OCR_LANG):
     # --- Stage 3: TrOCR (Handwriting Expert) ---
     is_still_bad = best_quality < 45.0 or _is_likely_handwritten(best_text, best_conf)
     
-    if is_still_bad and 'TrOCRProcessor' in globals():
-        # Use adaptive processing
-        hw_roi = image_utils.preprocess_for_handwriting(roi_original)
+    if is_still_bad and (_trocr_processor_instance is not None or 'TrOCRProcessor' in dir()):
+        # 🆕 Pass sr_applied flag to skip redundant SR
+        hw_roi = image_utils.preprocess_for_handwriting(
+            roi_original,
+            quality_metrics=None,
+            full_image_sr_applied=sr_applied
+        )
         trocr_text = ocr_with_trocr(hw_roi)
         if trocr_text:
             trocr_quality = _calculate_text_quality_score(trocr_text, 85.0)
@@ -742,14 +961,26 @@ def ocr_smart(original_bgr_image, binary_image, box, lang=DEFAULT_OCR_LANG):
     if best_quality < 20.0:
         return "", 0.0
 
-    # Apply text post-processing corrections (if enabled)
-    if ENABLE_TEXT_POSTPROCESSING:
-        # Language-aware corrections: only apply letter corrections to Western languages
-        if lang in ['eng', 'fra', 'deu', 'spa', 'por', 'ita']:
-            # Apply full corrections (letter substitutions + spacing)
-            best_text = text_postprocessing.apply_text_corrections(best_text)
-        else:
-            # For other languages, only fix spacing issues (safer)
-            best_text = text_postprocessing.fix_spacing_issues(best_text)
+    return _apply_post_processing(best_text, lang), best_conf
 
-    return best_text, best_conf
+
+def _apply_post_processing(text, lang):
+    """Apply text post-processing including fuzzy matching if enabled."""
+    if not ENABLE_TEXT_POSTPROCESSING:
+        return text
+    
+    # Language-aware corrections
+    if lang in ['eng', 'fra', 'deu', 'spa', 'por', 'ita']:
+        text = text_postprocessing.apply_text_corrections(text)
+    else:
+        text = text_postprocessing.fix_spacing_issues(text)
+    
+    # 🆕 Apply fuzzy dictionary matching if enabled
+    if USE_FUZZY_MATCHING:
+        try:
+            from . import dictionary_utils
+            text = dictionary_utils.apply_fuzzy_corrections(text)
+        except ImportError:
+            pass
+    
+    return text

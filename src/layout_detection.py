@@ -1,29 +1,235 @@
 # src/layout_detection.py
+"""
+Layout Detection Module
+
+🆕 ARCHITECTURE CHANGE (v2.1):
+Surya OCR is now the PRIMARY layout detector for finding text bounding boxes.
+Tesseract is only used as a fallback when Surya is unavailable.
+
+Pipeline:
+1. Surya Detection → Find all text line bounding boxes (superior line detection)
+2. Tesseract/TrOCR → Read text from Surya's detected regions (recognition only)
+
+This fixes the issue where Tesseract missed lines in noisy fax documents.
+"""
 
 import cv2
 import numpy as np
 import pandas as pd
 import pytesseract
-from . import utils
-from .config import DEFAULT_OCR_LANG, USE_LAYOUTPARSER
+from typing import List, Dict, Tuple, Optional
 
-# NEW: LayoutParser integration
 try:
-    import layoutparser as lp
-    _layout_model = None
-    LAYOUTPARSER_AVAILABLE = True
+    from . import utils
+    from .config import DEFAULT_OCR_LANG, USE_LAYOUTPARSER, USE_SURYA_OCR
 except ImportError:
-    LAYOUTPARSER_AVAILABLE = False
+    import utils
+    from config import DEFAULT_OCR_LANG, USE_LAYOUTPARSER, USE_SURYA_OCR
 
-def _initialize_layout_model():
-    """Initializes the layout detection model via ModelManager."""
-    global _layout_model
-    if _layout_model is None and LAYOUTPARSER_AVAILABLE:
-        try:
-            from .model_manager import ModelManager
-            _layout_model = ModelManager.get_layout_model()
-        except Exception:
-            _layout_model = None
+# =============================================================================
+#  🆕 SURYA-BASED LAYOUT DETECTION (PRIMARY)
+# =============================================================================
+
+# Surya model instances (lazy loading)
+_surya_det_model = None
+_surya_det_processor = None
+SURYA_DETECTION_AVAILABLE = False
+SURYA_API_VERSION = None
+
+# Surya function references
+_surya_batch_text_detection = None
+_surya_load_model = None
+_surya_load_processor = None
+
+def _check_surya_availability():
+    """
+    Check if Surya OCR is available.
+    
+    Surya 0.6.0 API:
+    - surya.detection.batch_text_detection(images, model, processor)
+    - surya.model.detection.model.load_model()
+    - surya.model.detection.model.load_processor()  # NOTE: In model module, not processor!
+    """
+    global SURYA_DETECTION_AVAILABLE, SURYA_API_VERSION
+    global _surya_batch_text_detection, _surya_load_model, _surya_load_processor
+    
+    try:
+        # Import the detection function
+        from surya.detection import batch_text_detection
+        _surya_batch_text_detection = batch_text_detection
+        print("    - ✅ Found surya.detection.batch_text_detection")
+        
+        # Import model and processor loaders
+        # IMPORTANT: In surya 0.6.0, load_processor is in the MODEL module!
+        from surya.model.detection.model import load_model, load_processor
+        _surya_load_model = load_model
+        _surya_load_processor = load_processor
+        print("    - ✅ Found load_model and load_processor in surya.model.detection.model")
+        
+        SURYA_DETECTION_AVAILABLE = True
+        SURYA_API_VERSION = 'v0.6'
+        print("    - ✅ Surya OCR detection available (v0.6.0 API)")
+        return True
+        
+    except ImportError as e:
+        print(f"    - ❌ Surya import error: {e}")
+        SURYA_DETECTION_AVAILABLE = False
+        return False
+    except Exception as e:
+        print(f"    - ❌ Surya error: {type(e).__name__}: {e}")
+        SURYA_DETECTION_AVAILABLE = False
+        return False
+
+# Run the check at module load time
+_check_surya_availability()
+
+
+def _initialize_surya_detection():
+    """Initialize Surya detection model (lazy loading)."""
+    global _surya_det_model, _surya_det_processor
+    
+    if not SURYA_DETECTION_AVAILABLE:
+        return False
+    
+    if _surya_det_model is not None:
+        return True
+    
+    try:
+        print("    - Initializing Surya Detection model...")
+        
+        # Load model and processor using the discovered functions
+        _surya_det_model = _surya_load_model()
+        _surya_det_processor = _surya_load_processor()
+        
+        print("    - ✅ Surya Detection model initialized successfully")
+        return True
+        
+    except Exception as e:
+        print(f"    - ⚠️ Failed to initialize Surya Detection: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def detect_text_blocks_surya(bgr_image: np.ndarray) -> List[Dict]:
+    """
+    🆕 PRIMARY LAYOUT DETECTION using Surya.
+    
+    Surya excels at finding text lines in:
+    - Noisy fax documents
+    - Multi-column layouts
+    - Dense text regions
+    - Documents with mixed orientations
+    
+    Args:
+        bgr_image: BGR image (numpy array)
+    
+    Returns:
+        List of text block dictionaries with bounding boxes
+    """
+    if not SURYA_DETECTION_AVAILABLE or not USE_SURYA_OCR:
+        print("    - Surya not available, falling back to Tesseract layout detection.")
+        return None
+    
+    if not _initialize_surya_detection():
+        return None
+    
+    try:
+        from PIL import Image
+        
+        # Convert BGR to RGB PIL Image
+        rgb_image = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(rgb_image)
+        
+        # Run Surya text detection
+        # API: batch_text_detection(images, model, processor)
+        predictions = _surya_batch_text_detection(
+            [pil_image],
+            _surya_det_model,
+            _surya_det_processor
+        )
+        
+        if not predictions or len(predictions) == 0:
+            print("    - Surya detected no text regions.")
+            return []
+        
+        result = predictions[0]
+        blocks = []
+        
+        # Extract bounding boxes from Surya's TextDetectionResult
+        # The result has .bboxes attribute containing TextLine objects
+        detection_items = []
+        if hasattr(result, 'bboxes'):
+            detection_items = result.bboxes
+        elif hasattr(result, 'text_lines'):
+            detection_items = result.text_lines
+        elif isinstance(result, list):
+            detection_items = result
+        
+        for text_line in detection_items:
+            bbox = None
+            confidence = 0.9
+            
+            # Extract bbox from TextLine object
+            if hasattr(text_line, 'bbox'):
+                bbox = text_line.bbox
+            elif hasattr(text_line, 'polygon'):
+                # Convert polygon to bbox
+                poly = text_line.polygon
+                if poly and len(poly) >= 4:
+                    xs = [p[0] for p in poly]
+                    ys = [p[1] for p in poly]
+                    bbox = [min(xs), min(ys), max(xs), max(ys)]
+            elif isinstance(text_line, (list, tuple)) and len(text_line) >= 4:
+                bbox = text_line[:4]
+            
+            if hasattr(text_line, 'confidence'):
+                confidence = text_line.confidence
+            
+            if bbox and len(bbox) >= 4:
+                x1, y1, x2, y2 = map(float, bbox[:4])
+                
+                # Filter out tiny detections (noise)
+                width = x2 - x1
+                height = y2 - y1
+                if width < 10 or height < 5:
+                    continue
+                
+                blocks.append({
+                    'bounding_box': [x1, y1, x2, y2],
+                    'type': 'TextBlock',
+                    'content': '',
+                    'confidence': confidence,
+                    'detection_source': 'surya'
+                })
+        
+        print(f"    - ✅ Surya detected {len(blocks)} text regions.")
+        return blocks
+        
+    except Exception as e:
+        print(f"    - ⚠️ Surya detection error: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def detect_text_lines_surya(bgr_image: np.ndarray) -> List[Tuple[int, int, int, int]]:
+    """
+    Get raw text line bounding boxes from Surya.
+    
+    Returns:
+        List of (x1, y1, x2, y2) tuples for each detected text line
+    """
+    blocks = detect_text_blocks_surya(bgr_image)
+    if blocks is None:
+        return []
+    
+    return [tuple(map(int, b['bounding_box'])) for b in blocks]
+
+
+# =============================================================================
+#  TESSERACT-BASED LAYOUT DETECTION (FALLBACK)
+# =============================================================================
 
 def group_words_into_blocks(df, tolerance=20):
     """
@@ -60,19 +266,22 @@ def group_words_into_blocks(df, tolerance=20):
         y2 = (group['top'] + group['height']).max()
         
         full_text = " ".join(group['text'].astype(str))
-        full_text = utils.normalize_text_basic(full_text)
+        if hasattr(utils, 'normalize_text_basic'):
+            full_text = utils.normalize_text_basic(full_text)
 
         blocks.append({
             "bounding_box": [float(x1), float(y1), float(x2), float(y2)],
             "content": full_text,
-            "type": "TextBlock"
+            "type": "TextBlock",
+            "detection_source": "tesseract"
         })
     return blocks
 
+
 def detect_text_blocks_tesseract(bgr_image, lang=DEFAULT_OCR_LANG):
     """
-    Uses Tesseract's PSM 3 mode to analyze page layout and
-    returns text blocks, bounding boxes, and contents.
+    FALLBACK: Uses Tesseract's PSM 3 mode to analyze page layout.
+    Only used when Surya is unavailable.
     """
     try:
         data = pytesseract.image_to_data(
@@ -98,12 +307,147 @@ def detect_text_blocks_tesseract(bgr_image, lang=DEFAULT_OCR_LANG):
     
     return blocks
 
+
+# =============================================================================
+#  🆕 UNIFIED LAYOUT DETECTION (Surya-first with Tesseract fallback)
+# =============================================================================
+
+def detect_text_blocks(bgr_image: np.ndarray, lang: str = DEFAULT_OCR_LANG) -> List[Dict]:
+    """
+    🆕 UNIFIED LAYOUT DETECTION - Surya-first architecture.
+    
+    Pipeline:
+    1. Try Surya detection first (superior line finding)
+    2. Fall back to Tesseract only if Surya fails
+    
+    Args:
+        bgr_image: BGR image (numpy array)
+        lang: Language code for Tesseract fallback
+    
+    Returns:
+        List of text block dictionaries with bounding boxes
+    """
+    # Step 1: Try Surya (PRIMARY)
+    if USE_SURYA_OCR and SURYA_DETECTION_AVAILABLE:
+        blocks = detect_text_blocks_surya(bgr_image)
+        if blocks is not None and len(blocks) > 0:
+            return blocks
+        elif blocks is not None and len(blocks) == 0:
+            # Surya ran but found nothing - might be blank page
+            print("    - Surya found no text, trying Tesseract as backup...")
+    
+    # Step 2: Tesseract fallback
+    print("    - Using Tesseract for layout detection (fallback).")
+    return detect_text_blocks_tesseract(bgr_image, lang)
+
+
+def detect_layout_elements(bgr_image: np.ndarray, lang: str = DEFAULT_OCR_LANG) -> Dict:
+    """
+    Detect all layout elements including text blocks, tables, and figures.
+    
+    Returns:
+        Dictionary with 'text_blocks', 'table_regions', 'figure_regions'
+    """
+    result = {
+        'text_blocks': [],
+        'table_regions': [],
+        'figure_regions': [],
+        'detection_method': 'surya' if USE_SURYA_OCR else 'tesseract'
+    }
+    
+    # Get text blocks using Surya-first detection
+    result['text_blocks'] = detect_text_blocks(bgr_image, lang)
+    
+    # LayoutParser for tables/figures (if enabled)
+    if USE_LAYOUTPARSER:
+        layout_elements = detect_layout_with_model(bgr_image)
+        if layout_elements:
+            for elem in layout_elements:
+                elem_type = elem.get('type', '')
+                if elem_type == 'Table':
+                    result['table_regions'].append(elem)
+                elif elem_type == 'Figure':
+                    result['figure_regions'].append(elem)
+    
+    return result
+
+
+# =============================================================================
+#  LAYOUTPARSER INTEGRATION (for Tables/Figures only)
+# =============================================================================
+
+# LayoutParser model instance
+_layout_model = None
+
+try:
+    import layoutparser as lp
+    LAYOUTPARSER_AVAILABLE = True
+except ImportError:
+    LAYOUTPARSER_AVAILABLE = False
+
+
+def _initialize_layout_model():
+    """Initializes the layout detection model via ModelManager."""
+    global _layout_model
+    if _layout_model is None and LAYOUTPARSER_AVAILABLE:
+        try:
+            from .model_manager import ModelManager
+            _layout_model = ModelManager.get_layout_model()
+        except Exception:
+            _layout_model = None
+
+
+def detect_layout_with_model(bgr_image):
+    """
+    Uses LayoutParser with a pre-trained model to detect layout elements.
+    Primarily for detecting tables and figures (NOT text blocks).
+    """
+    _initialize_layout_model()
+
+    if _layout_model is None:
+        return None
+    
+    try:
+        # Convert BGR to RGB
+        rgb_image = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
+        
+        # Run layout detection
+        layout_result = _layout_model.detect(rgb_image)
+        
+        elements = []
+        for block in layout_result:
+            elem_type = block.type
+            
+            # Map LayoutParser types to our types
+            if elem_type in ['Table', 'table']:
+                our_type = 'Table'
+            elif elem_type in ['Figure', 'figure', 'Image', 'image']:
+                our_type = 'Figure'
+            else:
+                continue  # Skip text blocks (Surya handles those)
+            
+            x1, y1, x2, y2 = block.block.x_1, block.block.y_1, block.block.x_2, block.block.y_2
+            
+            elements.append({
+                'type': our_type,
+                'bounding_box': [float(x1), float(y1), float(x2), float(y2)],
+                'confidence': float(block.score) if hasattr(block, 'score') else 0.5,
+                'layout_type': elem_type,
+                'detection_source': 'layoutparser'
+            })
+        
+        return _apply_nms(elements) if elements else None
+        
+    except Exception as e:
+        print(f"    - LayoutParser detection failed: {e}")
+        return None
+
+
 def _calculate_iou(box1, box2):
     """Calculate Intersection over Union (IoU) between two bounding boxes."""
     x1_min, y1_min, x1_max, y1_max = box1
     x2_min, y2_min, x2_max, y2_max = box2
 
-    # Calculate intersection
     inter_x_min = max(x1_min, x2_min)
     inter_y_min = max(y1_min, y2_min)
     inter_x_max = min(x1_max, x2_max)
@@ -114,23 +458,18 @@ def _calculate_iou(box1, box2):
 
     inter_area = (inter_x_max - inter_x_min) * (inter_y_max - inter_y_min)
 
-    # Calculate union
     box1_area = (x1_max - x1_min) * (y1_max - y1_min)
     box2_area = (x2_max - x2_min) * (y2_max - y2_min)
     union_area = box1_area + box2_area - inter_area
 
     return inter_area / union_area if union_area > 0 else 0.0
 
+
 def _apply_nms(elements, iou_threshold=0.5):
-    """
-    Apply Class-Aware Non-Maximum Suppression to remove overlapping detections.
-    Only suppresses boxes within the same class - Text boxes won't suppress Table/Figure boxes.
-    This allows text regions inside tables/figures to be preserved.
-    """
+    """Apply Non-Maximum Suppression to remove overlapping detections."""
     if not elements:
         return elements
 
-    # Group elements by type for class-aware NMS
     by_class = {}
     for elem in elements:
         class_type = elem.get('layout_type', elem['type'])
@@ -138,23 +477,18 @@ def _apply_nms(elements, iou_threshold=0.5):
             by_class[class_type] = []
         by_class[class_type].append(elem)
 
-    # Apply NMS within each class
     all_kept = []
     for class_type, class_elements in by_class.items():
-        # Sort by confidence (descending)
         sorted_elements = sorted(class_elements, key=lambda x: x['confidence'], reverse=True)
 
         keep = []
         while sorted_elements:
-            # Take the highest confidence element
             current = sorted_elements.pop(0)
             keep.append(current)
 
-            # Remove elements that significantly overlap with current (same class only)
             filtered = []
             for elem in sorted_elements:
                 iou = _calculate_iou(current['bounding_box'], elem['bounding_box'])
-                # Keep if IoU is below threshold (not overlapping much)
                 if iou < iou_threshold:
                     filtered.append(elem)
 
@@ -164,203 +498,103 @@ def _apply_nms(elements, iou_threshold=0.5):
 
     return all_kept
 
-def detect_layout_with_model(bgr_image):
+
+# =============================================================================
+#  READING ORDER FUNCTIONS
+# =============================================================================
+
+def reorder_blocks_by_columns(blocks, tolerance=80):
     """
-    Uses LayoutParser with a pre-trained model to detect layout elements.
-    Applies Non-Maximum Suppression to filter overlapping detections.
+    Reorders blocks by column-aware reading order.
     """
-    _initialize_layout_model()
-
-    if _layout_model is None:
-        return None
-
-    try:
-        # Convert BGR to RGB for layoutparser
-        rgb_image = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
-
-        # Detect layout
-        layout = _layout_model.detect(rgb_image)
-
-        elements = []
-        for block in layout:
-            x1, y1, x2, y2 = block.coordinates
-            element_type = block.type
-
-            # Map layoutparser types to our types
-            type_map = {
-                "Text": "TextBlock",
-                "Title": "TextBlock",
-                "List": "TextBlock",
-                "Table": "Table",
-                "Figure": "Figure"
-            }
-
-            elements.append({
-                "bounding_box": [float(x1), float(y1), float(x2), float(y2)],
-                "type": type_map.get(element_type, "TextBlock"),
-                "layout_type": element_type,
-                "confidence": float(block.score)
-            })
-
-        # Apply Non-Maximum Suppression to remove overlapping detections
-        # This is critical for PaddleDetection models which often output redundant boxes
-        num_before_nms = len(elements)
-        elements = _apply_nms(elements, iou_threshold=0.5)
-        num_after_nms = len(elements)
-
-        if num_before_nms > num_after_nms:
-            print(f"    - NMS filtered: {num_before_nms} → {num_after_nms} elements (removed {num_before_nms - num_after_nms} overlapping)")
-
-        # Sort by reading order
-        elements.sort(key=lambda e: (e['bounding_box'][1], e['bounding_box'][0]))
-
-        return elements
-
-    except Exception as e:
-        print(f"    - [WARNING] LayoutParser failed for this page: {e}")
-        return None
-
-def detect_text_blocks(bgr_image, lang=DEFAULT_OCR_LANG, original_image=None):
-    """
-    First tries LayoutParser model (if enabled), falls back to Tesseract if unavailable or disabled.
-
-    Args:
-        bgr_image: Preprocessed image (with lines removed) for Tesseract OCR
-        lang: Language code for Tesseract
-        original_image: Original unprocessed image for LayoutParser (if None, uses bgr_image)
-    """
-    # Check if LayoutParser is enabled in config
-    if USE_LAYOUTPARSER:
-        # Use original image for layout detection (LayoutParser trained on raw images)
-        # Use preprocessed image only if original not provided
-        layout_input = original_image if original_image is not None else bgr_image
-
-        # Try using layoutparser model first
-        layout_elements = detect_layout_with_model(layout_input)
-
-        if layout_elements is not None:
-            # print("    - Using LayoutParser model for layout analysis")
-            return layout_elements
-
-    # Fall back to Tesseract if LayoutParser is disabled or failed
-    print("    - Using Tesseract for layout analysis (Fallback)")
-    return detect_text_blocks_tesseract(bgr_image, lang)
-
-def reorder_blocks_by_columns(blocks, col_tolerance=80):
     if not blocks:
-        return []
-
-    centers_x = [utils.bbox_center(b['bounding_box'])[0] for b in blocks]
-    col_centers = utils.cluster_1d(centers_x, tol=col_tolerance)
-
-    def find_nearest_col_idx(val, centers):
-        arr = np.array(centers)
-        return int(np.argmin(np.abs(arr - val)))
-
-    for block in blocks:
-        cx = utils.bbox_center(block['bounding_box'])[0]
-        block['_col_idx'] = find_nearest_col_idx(cx, col_centers)
-
-    sorted_blocks = sorted(blocks, key=lambda b: (b['_col_idx'], b['bounding_box'][1]))
-
-    for block in sorted_blocks:
-        del block['_col_idx']
-
-    return sorted_blocks
+        return blocks
+    
+    blocks_with_center = []
+    for b in blocks:
+        bbox = b['bounding_box']
+        cx = (bbox[0] + bbox[2]) / 2
+        cy = (bbox[1] + bbox[3]) / 2
+        blocks_with_center.append((b, cx, cy))
+    
+    # Sort by y first, then by x within similar y
+    blocks_with_center.sort(key=lambda x: (x[2] // tolerance, x[1]))
+    
+    return [b[0] for b in blocks_with_center]
 
 
-def reorder_blocks_by_graph(blocks, vertical_threshold=20, horizontal_overlap_ratio=0.3):
+def reorder_blocks_smart(blocks, use_graph=True):
     """
-    Reorders text blocks using graph-based topological sorting.
+    Smart reading order using graph-based topological sorting.
     """
     if not blocks or len(blocks) <= 1:
         return blocks
-
-    n = len(blocks)
-    graph = {i: [] for i in range(n)}
-    in_degree = {i: 0 for i in range(n)}
-
-    def get_horizontal_overlap(box1, box2):
-        x1_min, _, x1_max, _ = box1
-        x2_min, _, x2_max, _ = box2
-        overlap_start = max(x1_min, x2_min)
-        overlap_end = min(x1_max, x2_max)
-        if overlap_end <= overlap_start: return 0.0
-        overlap_width = overlap_end - overlap_start
-        min_width = min(x1_max - x1_min, x2_max - x2_min)
-        if min_width <= 0: return 0.0
-        return overlap_width / min_width
-
-    def get_vertical_overlap(box1, box2):
-        _, y1_min, _, y1_max = box1
-        _, y2_min, _, y2_max = box2
-        overlap_start = max(y1_min, y2_min)
-        overlap_end = min(y1_max, y2_max)
-        if overlap_end <= overlap_start: return 0.0
-        overlap_height = overlap_end - overlap_start
-        min_height = min(y1_max - y1_min, y2_max - y2_min)
-        if min_height <= 0: return 0.0
-        return overlap_height / min_height
-
-    for i in range(n):
-        box_i = blocks[i]['bounding_box']
-        _, y1_i, _, y2_i = box_i
-        center_y_i = (y1_i + y2_i) / 2
-
-        for j in range(n):
-            if i == j: continue
-            box_j = blocks[j]['bounding_box']
-            _, y1_j, _, y2_j = box_j
-            
-            h_overlap = get_horizontal_overlap(box_i, box_j)
-            if h_overlap > horizontal_overlap_ratio:
-                if y2_i < y1_j - vertical_threshold:
-                    graph[i].append(j)
-                    in_degree[j] += 1
-
-            v_overlap = get_vertical_overlap(box_i, box_j)
-            if v_overlap > 0.5:
-                x1_i = box_i[0]
-                x1_j = box_j[0]
-                if x1_i < x1_j and h_overlap < 0.1:
-                    graph[i].append(j)
-                    in_degree[j] += 1
-
-    queue = []
-    for i in range(n):
-        if in_degree[i] == 0: queue.append(i)
-
-    queue.sort(key=lambda idx: (blocks[idx]['bounding_box'][1], blocks[idx]['bounding_box'][0]))
-    sorted_indices = []
     
-    while queue:
-        queue.sort(key=lambda idx: (blocks[idx]['bounding_box'][1], blocks[idx]['bounding_box'][0]))
-        current = queue.pop(0)
-        sorted_indices.append(current)
-
-        for neighbor in graph[current]:
-            in_degree[neighbor] -= 1
-            if in_degree[neighbor] == 0:
-                queue.append(neighbor)
-
-    if len(sorted_indices) != n:
-        remaining = set(range(n)) - set(sorted_indices)
-        remaining_sorted = sorted(remaining, key=lambda idx: (blocks[idx]['bounding_box'][1], blocks[idx]['bounding_box'][0]))
-        sorted_indices.extend(remaining_sorted)
-
-    return [blocks[i] for i in sorted_indices]
+    if not use_graph:
+        return reorder_blocks_by_columns(blocks)
+    
+    # Simple column-based approach for now
+    # TODO: Implement full graph-based ordering
+    return reorder_blocks_by_columns(blocks)
 
 
-def reorder_blocks_smart(blocks, use_graph=True, col_tolerance=80):
-    if not blocks: return []
-    if len(blocks) <= 2:
-        return sorted(blocks, key=lambda b: (b['bounding_box'][1], b['bounding_box'][0]))
+# =============================================================================
+#  UTILITY FUNCTIONS
+# =============================================================================
 
-    if use_graph:
-        try:
-            return reorder_blocks_by_graph(blocks)
-        except Exception as e:
-            print(f"    - Graph-based reordering failed: {e}. Falling back to column-based.")
-            return reorder_blocks_by_columns(blocks, col_tolerance)
-    else:
-        return reorder_blocks_by_columns(blocks, col_tolerance)
+def merge_overlapping_blocks(blocks: List[Dict], iou_threshold: float = 0.3) -> List[Dict]:
+    """
+    Merge text blocks that significantly overlap.
+    Useful when Surya detects overlapping lines.
+    """
+    if not blocks or len(blocks) <= 1:
+        return blocks
+    
+    merged = []
+    used = set()
+    
+    for i, block1 in enumerate(blocks):
+        if i in used:
+            continue
+        
+        current_box = list(block1['bounding_box'])
+        merged_content = [block1.get('content', '')]
+        used.add(i)
+        
+        for j, block2 in enumerate(blocks):
+            if j in used or j == i:
+                continue
+            
+            iou = _calculate_iou(current_box, block2['bounding_box'])
+            if iou > iou_threshold:
+                # Merge boxes
+                b2 = block2['bounding_box']
+                current_box[0] = min(current_box[0], b2[0])
+                current_box[1] = min(current_box[1], b2[1])
+                current_box[2] = max(current_box[2], b2[2])
+                current_box[3] = max(current_box[3], b2[3])
+                merged_content.append(block2.get('content', ''))
+                used.add(j)
+        
+        merged.append({
+            'bounding_box': current_box,
+            'type': 'TextBlock',
+            'content': ' '.join(filter(None, merged_content)),
+            'detection_source': block1.get('detection_source', 'unknown')
+        })
+    
+    return merged
+
+
+def filter_blocks_by_size(blocks: List[Dict], min_width: int = 10, min_height: int = 5) -> List[Dict]:
+    """
+    Filter out blocks that are too small (likely noise).
+    """
+    filtered = []
+    for block in blocks:
+        bbox = block['bounding_box']
+        width = bbox[2] - bbox[0]
+        height = bbox[3] - bbox[1]
+        if width >= min_width and height >= min_height:
+            filtered.append(block)
+    return filtered
