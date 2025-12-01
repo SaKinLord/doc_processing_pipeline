@@ -65,7 +65,7 @@ SUPER_RESOLUTION_MODEL = 'EDSR'
 # Note: LayoutParser with PaddleDetection has known limitations with text detection.
 # Tesseract often provides better text detection results. Set to False if experiencing
 # poor text detection or class collapse issues.
-USE_LAYOUTPARSER = False  # Recommended: Keep disabled for better text detection
+USE_LAYOUTPARSER = True  # Recommended: Keep disabled for better text detection
 
 # Minimum area to be considered as a text block (square pixels)
 BLOCK_MIN_AREA = 500
@@ -124,7 +124,7 @@ SURYA_CONFIDENCE_THRESHOLD = 0.6
 # =============================================================================
 # Enable VLM for complex form understanding and confirmation
 # WARNING: This feature requires significant GPU memory (8GB+ VRAM)
-USE_VLM = False  # Disabled by default due to high GPU requirements
+USE_VLM = True  # Disabled by default due to high GPU requirements
 
 # VLM model to use: 'qwen-vl-chat' or 'llava-1.5'
 # qwen-vl-chat: Better for structured extraction, supports Chinese
