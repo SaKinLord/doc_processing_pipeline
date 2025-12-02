@@ -16,9 +16,19 @@ except ImportError:
 _figure_classifier_instance = None
 
 
+# =============================================================================
+# REPLACEMENT FUNCTION 1: validate_figure_candidate (FROM PATCH)
+# =============================================================================
+
 def validate_figure_candidate(box, original_bgr_image, text_blocks=None):
     """
-    Validates a figure candidate box to eliminate false positives.
+    🔧 IMPROVED: Validates a figure candidate box to eliminate false positives.
+    
+    Changes:
+    - Added maximum size limit (40% of page instead of allowing 80%)
+    - Added "mostly white" detection
+    - Stricter edge density requirement for large boxes
+    - Better aspect ratio filtering
 
     Returns True if the candidate passes validation, False otherwise.
     """
@@ -33,13 +43,26 @@ def validate_figure_candidate(box, original_bgr_image, text_blocks=None):
     box_height = y2 - y1
     box_area = box_width * box_height
     page_area = w * h
+    
+    coverage_ratio = box_area / page_area if page_area > 0 else 0
 
-    # STRICT CHECK 1: Size Floor - Reject very small specks (< 1% of page)
-    if box_area < 0.01 * page_area:
+    # 🔧 FIX 1: Size Floor - Reject very small specks (< 1% of page)
+    if coverage_ratio < 0.01:
+        return False
+    
+    # 🔧 FIX 2: Size Ceiling - Reject giant boxes (> 40% of page)
+    # Real figures rarely cover more than 40% of a page
+    if coverage_ratio > 0.40:
+        return False
+    
+    # 🔧 FIX 3: Lower half giant box filter
+    # Boxes in lower 40% of page covering >20% are likely signature areas
+    box_center_y = (y1 + y2) / 2
+    is_lower_portion = box_center_y > h * 0.6
+    if is_lower_portion and coverage_ratio > 0.20:
         return False
 
-    # STRICT CHECK 2: Aspect Ratio Filter - Reject extremely thin/tall boxes
-    # These are likely margin lines, page borders, or artifacts
+    # STRICT CHECK: Aspect Ratio Filter
     if box_width > 0 and box_height > 0:
         width_to_height = box_width / box_height
         height_to_width = box_height / box_width
@@ -51,27 +74,45 @@ def validate_figure_candidate(box, original_bgr_image, text_blocks=None):
         # Reject horizontal lines (height/width < 0.1)
         if height_to_width < 0.1:
             return False
+        
+        # 🔧 FIX 4: Reject full-width boxes that are likely margins/footers
+        if box_width > w * 0.9 and box_height < h * 0.15:
+            return False
 
     roi = original_bgr_image[y1:y2, x1:x2]
 
     if roi.size == 0:
         return False
 
-    # STRICT CHECK 3: Edge Density Check - Reject empty regions with no visual content
+    # 🔧 FIX 5: "Mostly White" Detection
+    # Convert to grayscale and check if region is mostly empty
     gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    mean_intensity = np.mean(gray_roi)
+    std_intensity = np.std(gray_roi)
+    
+    # If the region is very bright (white) with low variation, it's likely empty
+    if mean_intensity > 240 and std_intensity < 20:
+        return False
+    
+    # 🔧 FIX 6: Adaptive edge density based on box size
+    # Larger boxes need MORE content to be valid figures
     edges = cv2.Canny(gray_roi, 50, 150)
-
     total_pixels = edges.size
     edge_pixels = np.count_nonzero(edges)
     edge_density = (edge_pixels / total_pixels) * 100.0
 
-    # STRICT: Valid figures must have significant internal detail (>= 1%)
-    # Real figures/charts have lines and visual elements; empty margins do not
-    if edge_density < 1.0:
+    # Scale threshold by coverage - bigger boxes need more content
+    min_edge_density = 1.0 + (coverage_ratio * 10)  # e.g., 30% coverage needs 4% edge density
+    min_edge_density = min(min_edge_density, 5.0)  # Cap at 5%
+    
+    if edge_density < min_edge_density:
         return False
 
-    # STRICT CHECK 4: Text Overlap Check - Reject if figure overlaps significantly with text blocks
+    # STRICT CHECK: Text Overlap Check
     if text_blocks is not None:
+        text_overlap_count = 0
+        total_text_area_inside = 0
+        
         for text_block in text_blocks:
             if 'bounding_box' not in text_block:
                 continue
@@ -85,23 +126,57 @@ def validate_figure_candidate(box, original_bgr_image, text_blocks=None):
 
             if overlap_x2 > overlap_x1 and overlap_y2 > overlap_y1:
                 overlap_area = (overlap_x2 - overlap_x1) * (overlap_y2 - overlap_y1)
-                overlap_ratio = (overlap_area / box_area) * 100.0
+                text_area = (tx2 - tx1) * (ty2 - ty1)
+                
+                # Count significantly overlapping text blocks
+                if text_area > 0 and overlap_area / text_area > 0.5:
+                    text_overlap_count += 1
+                    total_text_area_inside += text_area
 
-                # Reject if overlap with ANY text block exceeds 10%
-                if overlap_ratio > 10.0:
-                    return False
+        # 🔧 FIX 7: If figure contains multiple text blocks, it's likely a TABLE not a figure
+        # Tables have lots of text inside them arranged in a grid
+        if text_overlap_count > 5:
+            return False
+        
+        # 🔧 FIX 8: If text covers significant portion of "figure", it's likely a table
+        text_coverage = total_text_area_inside / box_area if box_area > 0 else 0
+        if text_coverage > 0.15 and text_overlap_count > 3:
+            return False
+
+    # 🔧 FIX 9: Check for grid-like structure (indicates TABLE, not figure)
+    # Look for regular horizontal lines which suggest table rows
+    gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray_roi, 50, 150)
+    
+    # Detect horizontal lines using morphology
+    horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (box_width // 4, 1))
+    horizontal_lines = cv2.morphologyEx(edges, cv2.MORPH_OPEN, horizontal_kernel)
+    h_line_count = cv2.countNonZero(horizontal_lines)
+    
+    # If lots of horizontal lines relative to area, likely a table
+    h_line_density = h_line_count / box_area if box_area > 0 else 0
+    if h_line_density > 0.01 and text_overlap_count > 2:
+        return False
 
     return True
 
 
+# =============================================================================
+# REPLACEMENT FUNCTION 2: find_figure_candidates (FROM PATCH)
+# =============================================================================
+
 def find_figure_candidates(binarized_image_inv, original_bgr_image=None, text_blocks=None):
     """
-    Finds large and compact areas with low text density as figure candidates.
-    Uses strict validation to eliminate false positives.
+    🔧 IMPROVED: Finds figure candidates with stricter filtering.
+    
+    Changes:
+    - Reduced max size from 80% to 40%
+    - Added content density pre-check
+    - Better handling of mostly-empty regions
     """
     h, w = binarized_image_inv.shape[:2]
 
-    # CRITICAL FIX: Further reduced kernel to (3,3) to stop merging independent elements
+    # Use small kernel to avoid merging independent elements
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     blobs = cv2.morphologyEx(binarized_image_inv, cv2.MORPH_CLOSE, kernel, iterations=2)
 
@@ -111,15 +186,19 @@ def find_figure_candidates(binarized_image_inv, original_bgr_image=None, text_bl
     for cnt in contours:
         x, y, ww, hh = cv2.boundingRect(cnt)
         area = ww * hh
+        page_area = h * w
 
-        # Basic size filtering
-        if area < 0.02 * h * w or area > 0.8 * h * w:
+        # 🔧 FIX: Stricter size filtering
+        # Min: 2% of page (was 2%)
+        # Max: 40% of page (was 80%) - this is the key fix!
+        if area < 0.02 * page_area:
+            continue
+        if area > 0.40 * page_area:  # 🔧 Changed from 0.8 to 0.4
             continue
 
         candidate_box = [float(x), float(y), float(x + ww), float(y + hh)]
 
-        # CRITICAL FIX: Add density filter directly in candidate loop
-        # Check edge density to reject empty margin regions
+        # Content density check
         if original_bgr_image is not None:
             x1, y1, x2, y2 = int(x), int(y), int(x + ww), int(y + hh)
             # Boundary check
@@ -129,19 +208,27 @@ def find_figure_candidates(binarized_image_inv, original_bgr_image=None, text_bl
             if x2 > x1 and y2 > y1:
                 roi = original_bgr_image[y1:y2, x1:x2]
                 if roi.size > 0:
-                    # Calculate Canny edge density
+                    # Check if region is mostly white/empty
                     gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                    mean_val = np.mean(gray_roi)
+                    std_val = np.std(gray_roi)
+                    
+                    # 🔧 FIX: Skip mostly white regions
+                    if mean_val > 235 and std_val < 25:
+                        continue
+                    
+                    # Calculate Canny edge density
                     edges = cv2.Canny(gray_roi, 50, 150)
                     edge_density = np.count_nonzero(edges) / area if area > 0 else 0
 
-                    # STRICT: Reject if edge density < 1% (0.01)
-                    # Real figures/charts have internal lines and details
-                    # Empty page margins or solid blocks do not
-                    if edge_density < 0.01:
+                    # 🔧 FIX: Adaptive threshold - larger areas need more content
+                    coverage = area / page_area
+                    min_density = 0.01 + (coverage * 0.05)  # Scale with size
+                    
+                    if edge_density < min_density:
                         continue
 
-        # Strict validation: Only add if it passes all checks
-        # Better to miss a figure than to mark the entire page as a figure
+        # Strict validation
         if original_bgr_image is not None:
             if not validate_figure_candidate(candidate_box, original_bgr_image, text_blocks):
                 continue

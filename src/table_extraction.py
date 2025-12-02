@@ -1,9 +1,232 @@
 # src/table_extraction.py
+# 🔧 PATCHED VERSION with fixes for:
+# - Wrong region detection (headers/footers instead of data tables)
+# - OCR garbage in table cells
+# - Blank forms detected as tables
+# - Footer disclaimers captured as tables
 
 import cv2
 import numpy as np
 import pandas as pd
+import re
 from . import utils
+
+
+# =============================================================================
+# 🔧 NEW: CONTENT VALIDATION FUNCTIONS
+# =============================================================================
+
+def is_likely_table_content(text: str) -> bool:
+    """
+    Check if text looks like actual table data (not garbage or headers).
+    
+    Good table content has:
+    - Recognizable words or numbers
+    - Names, dates, amounts, codes
+    - Consistent patterns
+    
+    Bad content has:
+    - Mostly non-alphanumeric characters
+    - Random character sequences
+    - Very short fragments
+    - Words that don't exist in English
+    """
+    if not text or len(text.strip()) < 2:
+        return False
+    
+    text = text.strip()
+    
+    # Count alphanumeric vs total
+    alphanumeric = sum(1 for c in text if c.isalnum() or c.isspace())
+    total = len(text)
+    
+    # If less than 50% alphanumeric, likely garbage
+    if total > 0 and alphanumeric / total < 0.5:
+        return False
+    
+    # Check for common table data patterns FIRST (these are definitely valid)
+    table_patterns = [
+        r'\$[\d,]+\.?\d*',           # Currency
+        r'\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}',  # Dates
+        r'\(\d{3}\)\s*\d{3}[-.]?\d{4}',  # Phone numbers
+        r'\d+%',                     # Percentages
+        r'\d{3,}',                   # 3+ digit numbers
+    ]
+    
+    for pattern in table_patterns:
+        if re.search(pattern, text):
+            return True  # Definitely valid data
+    
+    # 🔧 Check for OCR garbage patterns
+    def looks_like_garbage(word):
+        """Check if a single word looks like OCR garbage."""
+        if len(word) <= 3:
+            return False  # Short words are OK
+        
+        word_upper = word.upper()
+        word_lower = word.lower()
+        
+        # Check for repeated unusual patterns
+        unusual_doubles = ['II', 'UU', 'AA', 'IIU', 'UUI', 'IUI']
+        for pattern in unusual_doubles:
+            if pattern in word_upper and word_upper not in ['HAWAII', 'SKIING', 'RADII']:
+                return True
+        
+        # Count consonants in a row
+        max_consonants = 0
+        current_consonants = 0
+        for c in word_lower:
+            if c.isalpha() and c not in 'aeiou':
+                current_consonants += 1
+                max_consonants = max(max_consonants, current_consonants)
+            else:
+                current_consonants = 0
+        
+        # 4+ consonants in a row is suspicious for English
+        if max_consonants >= 4:
+            if not any(p in word_lower for p in ['str', 'thr', 'sch', 'chr', 'spr', 'ngth']):
+                return True
+        
+        # Check for no vowels in a long word
+        if len(word) > 4 and not any(c in word_lower for c in 'aeiou'):
+            return True
+        
+        # Check for all-caps words that look like misread text
+        if word.isupper() and len(word) > 5:
+            vowel_count = sum(1 for c in word_lower if c in 'aeiou')
+            vowel_ratio = vowel_count / len(word) if len(word) > 0 else 0
+            if vowel_ratio < 0.2 or vowel_ratio > 0.6:
+                return True
+        
+        return False
+    
+    # Check each word
+    words = text.split()
+    garbage_words = 0
+    valid_words = 0
+    
+    for word in words:
+        clean_word = ''.join(c for c in word if c.isalpha())
+        if len(clean_word) < 2:
+            continue
+        if looks_like_garbage(clean_word):
+            garbage_words += 1
+        else:
+            valid_words += 1
+    
+    # If ANY garbage words detected, be more careful
+    total_words = garbage_words + valid_words
+    if total_words > 0:
+        garbage_ratio = garbage_words / total_words
+        if garbage_ratio >= 0.5:
+            return False
+        if garbage_words >= 1 and total_words <= 3:
+            return False
+    
+    # Check for names (capitalized words with vowels)
+    if re.search(r'[A-Z][a-z]+', text):
+        return True
+    
+    # Check for short abbreviations (2-4 uppercase chars)
+    if re.search(r'\b[A-Z]{2,4}\b', text):
+        return True
+    
+    # Check for any numbers
+    if re.search(r'\d+', text):
+        return True
+    
+    # Check for recognizable words with vowels
+    for word in words:
+        clean_word = ''.join(c for c in word if c.isalpha())
+        if len(clean_word) >= 3:
+            if any(c in clean_word.lower() for c in 'aeiou'):
+                if not looks_like_garbage(clean_word):
+                    return True
+    
+    return False
+
+
+def is_footer_disclaimer(text: str) -> bool:
+    """Detect if text is a footer disclaimer (should NOT be in tables)."""
+    if not text:
+        return False
+    
+    text_lower = text.lower()
+    
+    footer_indicators = [
+        'please call', 'support center', 'confidential', 'privileged',
+        'attorney', 'if you received this', 'intended recipient',
+        'not receive all', 'prohibited', 'thank you', 'fax number',
+        'copyright', 'all rights reserved', 'page 1 of', 'page _ of',
+    ]
+    
+    for indicator in footer_indicators:
+        if indicator in text_lower:
+            return True
+    
+    return False
+
+
+def is_form_label_only(text: str) -> bool:
+    """Detect if text is just a form field label (like "DATE:", "NAME:")."""
+    if not text:
+        return True
+    
+    text = text.strip()
+    
+    if text.endswith(':'):
+        return True
+    
+    form_labels = [
+        'date', 'name', 'from', 'to', 'subject', 're', 'cc',
+        'phone', 'fax', 'email', 'address', 'city', 'state', 'zip',
+        'total', 'amount', 'quantity', 'price', 'description',
+        'year', 'month', 'day', 'time', 'signature',
+    ]
+    
+    text_lower = text.lower().rstrip(':').strip()
+    if text_lower in form_labels:
+        return True
+    
+    return False
+
+
+def calculate_table_content_score(cells_text: list) -> float:
+    """Calculate a quality score for table content (0.0 to 1.0)."""
+    if not cells_text:
+        return 0.0
+    
+    valid_cells = 0
+    footer_cells = 0
+    label_only_cells = 0
+    
+    for text in cells_text:
+        if not text or len(text.strip()) < 2:
+            continue
+        
+        if is_footer_disclaimer(text):
+            footer_cells += 1
+        elif is_form_label_only(text):
+            label_only_cells += 1
+        elif is_likely_table_content(text):
+            valid_cells += 1
+    
+    total = len(cells_text)
+    if total == 0:
+        return 0.0
+    
+    if footer_cells > 0:
+        return 0.1
+    
+    if label_only_cells > valid_cells:
+        return 0.2
+    
+    return valid_cells / total
+
+
+# =============================================================================
+# ORIGINAL FUNCTIONS (with enhancements)
+# =============================================================================
 
 def find_lines(binarized_image_inv, min_len=400, gap=10, threshold=200):
     """
@@ -14,17 +237,12 @@ def find_lines(binarized_image_inv, min_len=400, gap=10, threshold=200):
     detected as table lines. Real tables have long lines (>400px); handwriting does not.
     """
     # NEW: Apply morphological operations to connect broken lines
-    # This makes faint, dashed, or broken lines more solid and easier to detect
-    
-    # Connect horizontal lines
     horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 1))
     enhanced_horizontal = cv2.dilate(binarized_image_inv, horizontal_kernel, iterations=1)
     
-    # Connect vertical lines
     vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 5))
     enhanced_vertical = cv2.dilate(binarized_image_inv, vertical_kernel, iterations=1)
     
-    # Combine both enhancements
     enhanced_image = cv2.bitwise_or(enhanced_horizontal, enhanced_vertical)
     
     edges = cv2.Canny(255 - enhanced_image, 50, 150, apertureSize=3)
@@ -41,6 +259,7 @@ def find_lines(binarized_image_inv, min_len=400, gap=10, threshold=200):
                 vertical.append((x1, y1, x2, y2))
                 
     return horizontal, vertical
+
 
 def merge_lines(lines, axis='h', tol=5):
     """Merges lines that are aligned and close to each other."""
@@ -70,7 +289,7 @@ def merge_lines(lines, axis='h', tol=5):
             y = int(np.median(y_coords))
             merged.append((x1, y, x2, y))
         return merged
-    else: # axis == 'v'
+    else:
         sorted_lines = sorted(lines, key=lambda l: ((l[0] + l[2]) / 2, l[1]))
         groups = []
         current_group = [sorted_lines[0]]
@@ -94,6 +313,7 @@ def merge_lines(lines, axis='h', tol=5):
             merged.append((x, y1, x, y2))
         return merged
 
+
 def lines_to_cells(horizontal_lines, vertical_lines, min_cell_wh=14):
     """Creates cell bounding boxes from merged horizontal and vertical lines."""
     if len(horizontal_lines) < 2 or len(vertical_lines) < 2:
@@ -111,6 +331,7 @@ def lines_to_cells(horizontal_lines, vertical_lines, min_cell_wh=14):
                 cells.append([float(x1), float(y1), float(x2), float(y2)])
     return cells
 
+
 def validate_table_structure(cells, text_blocks, page_width, page_height, occupied_cell_ratio_threshold=0.2, iou_threshold=0.8):
     """
     Validates whether a grid is a real table or a form based on the distribution
@@ -121,11 +342,9 @@ def validate_table_structure(cells, text_blocks, page_width, page_height, occupi
 
     total_cells = len(cells)
 
-    # STRICT CHECK 1: Minimum cell count - reject tables with fewer than 4 cells
     if total_cells < 4:
         return False
 
-    # STRICT CHECK 2: Calculate table bounding box and page coverage
     if cells:
         x_coords = [cell[0] for cell in cells] + [cell[2] for cell in cells]
         y_coords = [cell[1] for cell in cells] + [cell[3] for cell in cells]
@@ -136,52 +355,42 @@ def validate_table_structure(cells, text_blocks, page_width, page_height, occupi
 
         coverage_ratio = table_area / page_area if page_area > 0 else 0
 
-        # STRICT: If table covers > 65% of page, it must have at least 3 distinct columns
-        # Real tables covering most of the page need clear column structure
         if coverage_ratio > 0.65:
-            # Count distinct columns by clustering x-coordinates
             x_centers = [(cell[0] + cell[2]) / 2 for cell in cells]
             x_centers_sorted = sorted(set(x_centers))
 
-            # Group x-coordinates within tolerance to count columns
             distinct_cols = 1
             if len(x_centers_sorted) > 1:
                 prev_x = x_centers_sorted[0]
                 for x in x_centers_sorted[1:]:
-                    if abs(x - prev_x) > 30:  # 30px tolerance for column grouping
+                    if abs(x - prev_x) > 30:
                         distinct_cols += 1
                     prev_x = x
 
-            # Reject giant tables without sufficient column structure
             if distinct_cols < 3:
                 return False
 
-    # STRICT CHECK 3: Row/Col ratio - reject single-column "tables"
-    # Count distinct rows and columns
     y_centers = [(cell[1] + cell[3]) / 2 for cell in cells]
     x_centers = [(cell[0] + cell[2]) / 2 for cell in cells]
 
-    # Cluster to find distinct rows
     y_sorted = sorted(set(y_centers))
     distinct_rows = 1
     if len(y_sorted) > 1:
         prev_y = y_sorted[0]
         for y in y_sorted[1:]:
-            if abs(y - prev_y) > 20:  # 20px tolerance for row grouping
+            if abs(y - prev_y) > 20:
                 distinct_rows += 1
             prev_y = y
 
-    # Cluster to find distinct columns
     x_sorted = sorted(set(x_centers))
     distinct_cols = 1
     if len(x_sorted) > 1:
         prev_x = x_sorted[0]
         for x in x_sorted[1:]:
-            if abs(x - prev_x) > 30:  # 30px tolerance for column grouping
+            if abs(x - prev_x) > 30:
                 distinct_cols += 1
             prev_x = x
 
-    # Reject if only 1 column (just rows of text, not a table)
     if distinct_cols < 2:
         return False
 
@@ -193,26 +402,23 @@ def validate_table_structure(cells, text_blocks, page_width, page_height, occupi
         if tb_area == 0: continue
 
         for i, cell_box in enumerate(cells):
-            # Check how much of the text block is inside the cell
             intersection_area = max(0, min(tb_box[2], cell_box[2]) - max(tb_box[0], cell_box[0])) * \
                                 max(0, min(tb_box[3], cell_box[3]) - max(tb_box[1], cell_box[1]))
 
             if (intersection_area / tb_area) > iou_threshold:
                 occupied_cells.add(i)
-                break # A text block belongs to only one cell
+                break
 
     occupied_ratio = len(occupied_cells) / total_cells
 
-    # If the occupancy rate of cells is too low, this is probably a form.
     if occupied_ratio < occupied_cell_ratio_threshold:
         return False
 
     return True
 
+
 def index_cells(cells, axis_tol=10):
-    """
-    Indexes cell list as (row, col) and returns a grid map.
-    """
+    """Indexes cell list as (row, col) and returns a grid map."""
     if not cells:
         return {}, 0, 0
 
@@ -242,6 +448,7 @@ def index_cells(cells, axis_tol=10):
         
     return grid_map, num_rows, num_cols
 
+
 def grid_to_dataframe(grid_map, num_rows, num_cols):
     """Converts grid map to a pandas DataFrame."""
     if not grid_map:
@@ -258,16 +465,56 @@ def grid_to_dataframe(grid_map, num_rows, num_cols):
             
     return pd.DataFrame(data)
 
+
+# =============================================================================
+# 🔧 IMPROVED: BORDERLESS TABLE DETECTION
+# =============================================================================
+
 def find_borderless_table_blocks(text_blocks, min_cols=2, min_rows=2, page_width=None, page_height=None):
     """
-    Finds a group of blocks forming a table based on text block alignment.
-    Includes safety check to prevent whole-page tables without clear column structure.
+    🔧 IMPROVED: Finds borderless tables with better validation.
+    
+    Key improvements:
+    1. Excludes header/footer regions
+    2. Validates content quality
+    3. Prioritizes data-rich regions
+    4. Filters out garbage OCR
     """
     if len(text_blocks) < min_cols * min_rows:
         return []
 
-    text_blocks.sort(key=lambda b: (b['bounding_box'][1], b['bounding_box'][0]))
+    # 🔧 FIX 1: Filter out header/footer regions
+    exclude_top_percent = 0.08
+    exclude_bottom_percent = 0.15
     
+    if page_height:
+        top_cutoff = page_height * exclude_top_percent
+        bottom_cutoff = page_height * (1 - exclude_bottom_percent)
+        
+        filtered_blocks = []
+        for block in text_blocks:
+            bbox = block.get('bounding_box', [0, 0, 0, 0])
+            block_center_y = (bbox[1] + bbox[3]) / 2
+            
+            # Skip blocks in header/footer regions
+            if block_center_y < top_cutoff or block_center_y > bottom_cutoff:
+                continue
+            
+            # 🔧 FIX 2: Skip blocks with footer disclaimer content
+            content = block.get('content', '')
+            if is_footer_disclaimer(content):
+                continue
+            
+            filtered_blocks.append(block)
+        
+        text_blocks = filtered_blocks
+    
+    if len(text_blocks) < min_cols * min_rows:
+        return []
+
+    text_blocks = sorted(text_blocks, key=lambda b: (b['bounding_box'][1], b['bounding_box'][0]))
+    
+    # Group into rows
     rows = []
     if not text_blocks:
         return []
@@ -285,8 +532,9 @@ def find_borderless_table_blocks(text_blocks, min_cols=2, min_rows=2, page_width
             current_row = [block]
     rows.append(sorted(current_row, key=lambda b: b['bounding_box'][0]))
 
-    max_cells = 0
+    # Find best table candidate with content scoring
     best_table_blocks = []
+    best_score = 0
 
     for i in range(len(rows)):
         num_cols = len(rows[i])
@@ -313,14 +561,24 @@ def find_borderless_table_blocks(text_blocks, min_cols=2, min_rows=2, page_width
             else:
                 break
         
+        # 🔧 FIX 3: Calculate content quality score
+        cells_text = [b.get('content', '') for b in current_table_blocks]
+        content_score = calculate_table_content_score(cells_text)
+        
+        # Skip tables with poor content quality
+        if content_score < 0.3:
+            continue
+        
         num_rows_in_candidate = len(set(tuple(b['bounding_box']) for b in current_table_blocks)) / num_cols if num_cols > 0 else 0
-        if len(current_table_blocks) > max_cells and num_rows_in_candidate >= min_rows:
-            max_cells = len(current_table_blocks)
-            best_table_blocks = current_table_blocks
+        if len(current_table_blocks) > best_score and num_rows_in_candidate >= min_rows:
+            # Weight by content quality
+            overall_score = len(current_table_blocks) * content_score
+            if overall_score > best_score:
+                best_score = overall_score
+                best_table_blocks = current_table_blocks
 
-    # CRITICAL SAFETY CHECK: Prevent whole-page tables without clear column structure
+    # 🔧 FIX 4: Final validation - check table doesn't span too much of page
     if best_table_blocks and page_width and page_height:
-        # Calculate table bounding box
         all_x = [coord for block in best_table_blocks for coord in [block['bounding_box'][0], block['bounding_box'][2]]]
         all_y = [coord for block in best_table_blocks for coord in [block['bounding_box'][1], block['bounding_box'][3]]]
 
@@ -331,7 +589,6 @@ def find_borderless_table_blocks(text_blocks, min_cols=2, min_rows=2, page_width
 
         coverage_ratio = table_area / page_area if page_area > 0 else 0
 
-        # Count distinct columns by clustering x-coordinates
         x_centers = [utils.bbox_center(block['bounding_box'])[0] for block in best_table_blocks]
         x_centers_sorted = sorted(set(x_centers))
 
@@ -339,13 +596,16 @@ def find_borderless_table_blocks(text_blocks, min_cols=2, min_rows=2, page_width
         if len(x_centers_sorted) > 1:
             prev_x = x_centers_sorted[0]
             for x in x_centers_sorted[1:]:
-                if abs(x - prev_x) > 30:  # 30px tolerance for column separation
+                if abs(x - prev_x) > 30:
                     distinct_cols += 1
                 prev_x = x
 
-        # STRICT: Reject if table covers > 65% of page and has fewer than 3 columns
-        # A real table covering most of the page MUST have multiple columns
+        # Reject if table covers > 65% of page and has fewer than 3 columns
         if coverage_ratio > 0.65 and distinct_cols < 3:
+            return []
+        
+        # 🔧 FIX 5: Also reject if > 70% coverage regardless of columns
+        if coverage_ratio > 0.70:
             return []
 
     return best_table_blocks
@@ -354,70 +614,68 @@ def find_borderless_table_blocks(text_blocks, min_cols=2, min_rows=2, page_width
 def detect_borderless_table_advanced(text_blocks, page_width, page_height):
     """
     Advanced borderless table detection using DBSCAN clustering.
-
-    Args:
-        text_blocks: List of text block dictionaries with 'bounding_box' keys
-        page_width: Width of the page
-        page_height: Height of the page
-
-    Returns:
-        dict or None: Table structure with grid info, or None if no table detected
     """
     if len(text_blocks) < 4:
         return None
 
     try:
         from sklearn.cluster import DBSCAN
-        import numpy as np
     except ImportError:
-        # Fall back to basic method if sklearn not available
         return None
 
-    # Extract bounding boxes
-    boxes = [block['bounding_box'] for block in text_blocks]
+    # 🔧 FIX: Filter header/footer before clustering
+    exclude_top = page_height * 0.08
+    exclude_bottom = page_height * 0.85
+    
+    filtered_blocks = [
+        b for b in text_blocks 
+        if exclude_top < (b['bounding_box'][1] + b['bounding_box'][3]) / 2 < exclude_bottom
+        and not is_footer_disclaimer(b.get('content', ''))
+    ]
+    
+    if len(filtered_blocks) < 4:
+        return None
 
-    # Calculate centers
+    boxes = [block['bounding_box'] for block in filtered_blocks]
     centers_x = [(b[0] + b[2]) / 2 for b in boxes]
     centers_y = [(b[1] + b[3]) / 2 for b in boxes]
 
-    # Cluster x-coordinates to find columns
     x_array = np.array(centers_x).reshape(-1, 1)
     col_clustering = DBSCAN(eps=30, min_samples=2).fit(x_array)
-
     col_labels = col_clustering.labels_
     n_columns = len(set(col_labels)) - (1 if -1 in col_labels else 0)
 
     if n_columns < 2:
-        return None  # Not enough columns for a table
+        return None
 
-    # Cluster y-coordinates to find rows
     y_array = np.array(centers_y).reshape(-1, 1)
     row_clustering = DBSCAN(eps=25, min_samples=2).fit(y_array)
-
     row_labels = row_clustering.labels_
     n_rows = len(set(row_labels)) - (1 if -1 in row_labels else 0)
 
     if n_rows < 2:
-        return None  # Not enough rows for a table
+        return None
 
-    # Build grid and check alignment quality
     grid = {}
-    for i, block in enumerate(text_blocks):
+    for i, block in enumerate(filtered_blocks):
         if col_labels[i] == -1 or row_labels[i] == -1:
-            continue  # Skip outliers
-
+            continue
         cell_key = (row_labels[i], col_labels[i])
         if cell_key not in grid:
             grid[cell_key] = []
         grid[cell_key].append(block)
 
-    # Calculate grid occupancy
     expected_cells = n_rows * n_columns
     occupied_cells = len(grid)
     occupancy_ratio = occupied_cells / expected_cells if expected_cells > 0 else 0
 
-    # A good table should have reasonable occupancy (>40%)
     if occupancy_ratio < 0.4:
+        return None
+
+    # 🔧 FIX: Validate content quality
+    all_text = [b.get('content', '') for blocks in grid.values() for b in blocks]
+    content_score = calculate_table_content_score(all_text)
+    if content_score < 0.3:
         return None
 
     return {
@@ -425,5 +683,6 @@ def detect_borderless_table_advanced(text_blocks, page_width, page_height):
         'n_rows': n_rows,
         'n_columns': n_columns,
         'grid': grid,
-        'occupancy_ratio': occupancy_ratio
+        'occupancy_ratio': occupancy_ratio,
+        'content_score': content_score
     }

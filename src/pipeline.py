@@ -14,10 +14,11 @@ Pipeline Flow:
    - OCR Recognition → Read text from the cropped region
 4. Post-processing → Fuzzy matching, text corrections
 
-🆕 v2.2 PATCH:
+🆕 v2.3 PATCH APPLIED:
 - Fixed false German detection on English documents
 - Added language pack availability check
 - Added confidence threshold for non-English detection
+- Added deterministic seeding for langdetect
 """
 
 import os
@@ -28,6 +29,13 @@ import pytesseract
 import subprocess  # 🆕 Added for language pack detection
 from langdetect import detect, LangDetectException, detect_langs
 from typing import List, Dict, Optional, Tuple
+
+# 🔧 FIX: Set deterministic seed for langdetect (Step 2 of Patch)
+try:
+    from langdetect import DetectorFactory
+    DetectorFactory.seed = 0
+except ImportError:
+    pass
 
 try:
     from . import (
@@ -308,12 +316,13 @@ class DocumentProcessor:
 
     def _detect_language(self):
         """
-        🆕 ENHANCED (v2.2): Detect document language with robust fallback.
+        🔧 FIXED (v2.3): Detect document language with robust multi-layer validation.
         
-        Fixes:
-        1. Validates that detected language pack is installed
-        2. Requires higher confidence (85%) for non-English detection
-        3. Maps commonly misdetected languages to English
+        Fixes applied:
+        - German misdetection on sparse forms with abbreviations
+        - Welsh/Celtic misdetection on handwritten OCR errors  
+        - Vietnamese/Hungarian misdetection on technical codes
+        - Non-deterministic langdetect behavior
         """
         print("  [4/8] Detecting language...")
         
@@ -323,60 +332,176 @@ class DocumentProcessor:
             print(f"    - Using override language: {self.language_override}")
             return
         
-        # Extended language mapping with misdetection fallbacks
+        # ═══════════════════════════════════════════════════════════════════════
+        # 🔧 FIX 1: Expanded language map - force misdetected languages to English
+        # ═══════════════════════════════════════════════════════════════════════
         lang_map = {
-            'en': 'eng', 'tr': 'tur', 'de': 'deu', 'fr': 'fra', 
-            'es': 'spa', 'it': 'ita', 'pt': 'por', 'nl': 'nld',
-            'pl': 'pol', 'ru': 'rus', 'ja': 'jpn', 'ko': 'kor',
-            'zh-cn': 'chi_sim', 'zh-tw': 'chi_tra', 'ar': 'ara',
-            # 🆕 Common misdetections → force English
-            'cy': 'eng', 'ca': 'eng', 'af': 'eng', 
-            'da': 'eng', 'no': 'eng', 'sv': 'eng',
-            'so': 'eng', 'tl': 'eng', 'sw': 'eng',
+            # Real language support (only include languages you actually need)
+            'en': 'eng', 
+            'tr': 'tur',  # Turkish - keep if you have Turkish documents
+            
+            # ═══════════════════════════════════════════════════════════════════
+            # ALL THESE ARE FORCED TO ENGLISH (common false positives):
+            # ═══════════════════════════════════════════════════════════════════
+            
+            # Germanic (often misdetected on abbreviations like "DEPT.", "MANUFACT.")
+            'de': 'eng',  # German
+            'nl': 'eng',  # Dutch
+            'af': 'eng',  # Afrikaans
+            'fy': 'eng',  # Frisian
+            
+            # Celtic (misdetected on OCR errors from handwriting)
+            'cy': 'eng',  # Welsh
+            'ga': 'eng',  # Irish
+            'gd': 'eng',  # Scottish Gaelic
+            
+            # Romance (misdetected on names, abbreviations)
+            'ca': 'eng',  # Catalan
+            'gl': 'eng',  # Galician
+            'pt': 'eng',  # Portuguese
+            'it': 'eng',  # Italian
+            'es': 'eng',  # Spanish
+            'fr': 'eng',  # French
+            'ro': 'eng',  # Romanian
+            'la': 'eng',  # Latin
+            'eo': 'eng',  # Esperanto
+            
+            # Nordic (misdetected on certain character patterns)
+            'da': 'eng',  # Danish
+            'no': 'eng',  # Norwegian
+            'sv': 'eng',  # Swedish
+            'is': 'eng',  # Icelandic
+            'fi': 'eng',  # Finnish
+            
+            # Slavic/Eastern European
+            'pl': 'eng',  # Polish
+            'cs': 'eng',  # Czech
+            'sk': 'eng',  # Slovak
+            'hr': 'eng',  # Croatian
+            'sl': 'eng',  # Slovenian
+            'hu': 'eng',  # Hungarian (misdetected on alphanumeric codes)
+            'et': 'eng',  # Estonian
+            'lt': 'eng',  # Lithuanian
+            'lv': 'eng',  # Latvian
+            
+            # Asian (misdetected on form patterns like "NO. PER PACK:")
+            'vi': 'eng',  # Vietnamese
+            'id': 'eng',  # Indonesian
+            'ms': 'eng',  # Malay
+            'tl': 'eng',  # Tagalog
+            'th': 'eng',  # Thai
+            
+            # Other common false positives
+            'so': 'eng',  # Somali
+            'sw': 'eng',  # Swahili
+            'sq': 'eng',  # Albanian
+            'mt': 'eng',  # Maltese
         }
         
+        # ═══════════════════════════════════════════════════════════════════════
+        # 🔧 FIX 2: Helper function to check for English patterns
+        # ═══════════════════════════════════════════════════════════════════════
+        def has_english_indicators(text):
+            """Check if text has English document patterns."""
+            import re
+            text_lower = text.lower()
+            
+            # Common English form/business patterns
+            patterns = [
+                r'\b(to|from|date|subject|re|cc|fax|phone|page)\s*:',
+                r'\b(mr|mrs|ms|dr|inc|corp|llc|ltd)\b\.?',
+                r'\b(please|thank|regards|sincerely|dear)\b',
+                r'\b(total|amount|number|name|address)\b',
+                r'\$\d+',  # Dollar amounts
+                r'\(\d{3}\)\s*\d{3}[-.]?\d{4}',  # US phone
+            ]
+            
+            matches = sum(1 for p in patterns if re.search(p, text_lower))
+            return matches >= 2
+        
+        def count_english_words(text):
+            """Count common English words in text."""
+            import re
+            common_words = {
+                'the', 'and', 'for', 'are', 'but', 'not', 'you', 'all', 'can',
+                'her', 'was', 'one', 'our', 'out', 'has', 'his', 'how', 'its',
+                'from', 'have', 'this', 'will', 'your', 'each', 'make', 'like',
+                'date', 'name', 'page', 'time', 'year', 'form', 'type', 'number',
+                'to', 'of', 'in', 'is', 'it', 'at', 'by', 'on', 'be', 'as', 'or',
+                'please', 'company', 'address', 'phone', 'fax', 'total', 'value',
+            }
+            words = re.findall(r'\b[a-zA-Z]{2,}\b', text.lower())
+            if not words:
+                return 0, 0
+            english_count = sum(1 for w in words if w in common_words)
+            return english_count, len(words)
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # Main detection logic
+        # ═══════════════════════════════════════════════════════════════════════
         try:
             sample_text = pytesseract.image_to_string(
                 self.binary_image[:min(500, self.height), :],
                 config="--oem 3 --psm 3"
             )
             
-            if sample_text and len(sample_text.strip()) > 20:
-                # 🆕 Use detect_langs to get confidence scores
-                try:
-                    lang_probs = detect_langs(sample_text)
-                    detected = lang_probs[0].lang if lang_probs else 'en'
-                    confidence = lang_probs[0].prob if lang_probs else 0.0
-                except:
-                    detected = detect(sample_text)
-                    confidence = 0.5
-                
-                tess_lang = lang_map.get(detected, 'eng')
-                
-                # 🆕 FIX 1: Check if the language pack is available
-                if tess_lang != 'eng' and not _is_tesseract_language_available(tess_lang):
-                    print(f"    - Detected '{detected}' but '{tess_lang}' pack not installed, using English")
-                    self.detected_lang_tess = 'eng'
-                    self.metadata['language'] = 'en'
-                    self.metadata['language_detection_fallback'] = True
-                    return
-                
-                # 🆕 FIX 2: Require higher confidence for non-English
-                if detected != 'en' and confidence < 0.85:
-                    print(f"    - Low confidence ({confidence:.2f}) for '{detected}', defaulting to English")
-                    self.detected_lang_tess = 'eng'
-                    self.metadata['language'] = 'en'
-                    self.metadata['language_detection_low_confidence'] = True
-                    return
-                
-                self.metadata['language'] = detected
-                self.metadata['language_confidence'] = confidence
-                self.detected_lang_tess = tess_lang
-                print(f"    - Detected language: {detected} → {self.detected_lang_tess} (conf: {confidence:.2f})")
-            else:
+            clean_text = sample_text.strip() if sample_text else ""
+            
+            # 🔧 FIX 3: Minimum text length requirement
+            if len(clean_text) < 30:
                 self.metadata['language'] = 'en'
                 self.detected_lang_tess = 'eng'
-                print("    - Insufficient text for detection, defaulting to English.")
+                print(f"    - Insufficient text ({len(clean_text)} chars), defaulting to English")
+                return
+            
+            # 🔧 FIX 4: Check for English patterns FIRST
+            if has_english_indicators(clean_text):
+                eng_count, total = count_english_words(clean_text)
+                if total > 0 and eng_count / total >= 0.15:
+                    self.metadata['language'] = 'en'
+                    self.metadata['language_confidence'] = 0.95
+                    self.detected_lang_tess = 'eng'
+                    print(f"    - English patterns detected ({eng_count}/{total} common words)")
+                    return
+            
+            # Run langdetect
+            try:
+                lang_probs = detect_langs(clean_text)
+                detected = lang_probs[0].lang if lang_probs else 'en'
+                confidence = lang_probs[0].prob if lang_probs else 0.0
+            except:
+                detected = 'en'
+                confidence = 0.5
+            
+            # Map to Tesseract language code (with force-English mapping)
+            tess_lang = lang_map.get(detected, 'eng')
+            
+            # 🔧 FIX 5: Check if language pack is available
+            if tess_lang != 'eng' and not _is_tesseract_language_available(tess_lang):
+                print(f"    - Detected '{detected}' but '{tess_lang}' pack not installed, using English")
+                self.detected_lang_tess = 'eng'
+                self.metadata['language'] = 'en'
+                self.metadata['language_detection_fallback'] = True
+                return
+            
+            # 🔧 FIX 6: Final English word check (override if high English ratio)
+            eng_count, total = count_english_words(clean_text)
+            if total > 5 and eng_count / total > 0.25:
+                self.metadata['language'] = 'en'
+                self.detected_lang_tess = 'eng'
+                self.metadata['language_confidence'] = confidence
+                print(f"    - High English word ratio ({eng_count}/{total}), using English")
+                return
+            
+            # Accept detection result
+            self.metadata['language'] = 'en' if tess_lang == 'eng' else detected
+            self.metadata['language_confidence'] = confidence
+            self.detected_lang_tess = tess_lang
+            
+            if tess_lang == 'eng':
+                print(f"    - Detected '{detected}' → mapped to English")
+            else:
+                print(f"    - Detected language: {detected} → {tess_lang} (conf: {confidence:.2f})")
                 
         except (LangDetectException, Exception) as e:
             self.metadata['language'] = 'en'

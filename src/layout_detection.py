@@ -111,6 +111,127 @@ def _initialize_surya_detection():
         return False
 
 
+# =============================================================================
+# 🔧 NOISE FILTER FUNCTIONS
+# =============================================================================
+
+def is_likely_noise_artifact(element, page_width, page_height, edge_margin_percent=0.05):
+    """
+    🔧 NOISE FILTER: Determines if a text block is likely noise/artifact.
+    
+    Filters out:
+    - Scanning artifacts at page edges
+    - OCR garbage (non-alphanumeric content)
+    - Very low confidence detections at edges
+    - Thin lines at page boundaries
+    
+    Args:
+        element: Dictionary with 'bounding_box', 'content', and optionally 'confidence' keys
+        page_width: Width of the page in pixels
+        page_height: Height of the page in pixels
+        edge_margin_percent: How close to edge to consider "edge" (default 5%)
+    
+    Returns:
+        True if the element is likely noise (should be REMOVED), False otherwise
+    """
+    if 'bounding_box' not in element:
+        return False
+    
+    x1, y1, x2, y2 = element['bounding_box']
+    box_width = x2 - x1
+    box_height = y2 - y1
+    box_area = box_width * box_height
+    page_area = page_width * page_height
+    
+    # Calculate edge margins
+    left_margin = page_width * edge_margin_percent
+    right_margin = page_width * (1 - edge_margin_percent)
+    top_margin = page_height * edge_margin_percent
+    bottom_margin = page_height * (1 - edge_margin_percent)
+    
+    # Check if near edge
+    near_left = x1 < left_margin
+    near_right = x2 > right_margin
+    near_top = y1 < top_margin
+    near_bottom = y2 > bottom_margin
+    is_at_edge = near_left or near_right or near_top or near_bottom
+    
+    # Get content and confidence
+    content = element.get('content', '').strip()
+    confidence = element.get('confidence', 0.5)
+    
+    # Convert confidence to 0-100 scale if needed
+    if confidence <= 1.0:
+        confidence = confidence * 100
+    
+    # Calculate size ratio
+    size_ratio = box_area / page_area if page_area > 0 else 0
+    
+    # RULE 1: Very small boxes at edges with low confidence
+    if size_ratio < 0.002 and is_at_edge and confidence < 30:
+        return True
+    
+    # RULE 2: Empty or near-empty content (if content has been OCR'd)
+    if content and len(content) < 2:
+        return True
+    
+    # RULE 3: Content is mostly non-alphanumeric (likely OCR garbage)
+    if content:
+        alphanumeric_count = sum(1 for c in content if c.isalnum())
+        if len(content) > 0 and alphanumeric_count / len(content) < 0.3:
+            return True
+    
+    # RULE 4: Very thin boxes at page edges (scanning artifacts)
+    aspect_ratio = box_width / box_height if box_height > 0 else 0
+    if is_at_edge:
+        # Extremely thin horizontal lines
+        if aspect_ratio > 20 and box_height < 20:
+            return True
+        # Extremely thin vertical lines  
+        if aspect_ratio < 0.05 and box_width < 20:
+            return True
+    
+    # RULE 5: Boxes at bottom edge with very low confidence
+    if near_bottom and confidence < 25 and size_ratio < 0.01:
+        return True
+    
+    # RULE 6: Full-width boxes at very bottom (page footer artifacts)
+    if box_width > page_width * 0.8 and y1 > page_height * 0.95:
+        return True
+    
+    return False
+
+
+def filter_noise_artifacts(blocks, page_width, page_height):
+    """
+    Filter out noise/artifact elements from a list of text blocks.
+    
+    Args:
+        blocks: List of block dictionaries
+        page_width: Width of the page
+        page_height: Height of the page
+    
+    Returns:
+        Filtered list with noise artifacts removed
+    """
+    if not blocks:
+        return blocks
+    
+    filtered = []
+    removed_count = 0
+    
+    for block in blocks:
+        if is_likely_noise_artifact(block, page_width, page_height):
+            removed_count += 1
+            continue
+        filtered.append(block)
+    
+    if removed_count > 0:
+        print(f"    - 🔧 Filtered {removed_count} noise/artifact blocks")
+    
+    return filtered
+
+
 def detect_text_blocks_surya(bgr_image: np.ndarray) -> List[Dict]:
     """
     🆕 PRIMARY LAYOUT DETECTION using Surya.
@@ -204,6 +325,11 @@ def detect_text_blocks_surya(bgr_image: np.ndarray) -> List[Dict]:
                 })
         
         print(f"    - ✅ Surya detected {len(blocks)} text regions.")
+        
+        # 🔧 NOISE FILTER: Remove edge artifacts and scanning noise
+        h, w = bgr_image.shape[:2]
+        blocks = filter_noise_artifacts(blocks, w, h)
+        
         return blocks
         
     except Exception as e:
