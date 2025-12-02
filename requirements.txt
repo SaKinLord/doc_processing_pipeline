@@ -54,8 +54,12 @@ torchaudio==2.3.1
 # =============================================================================
 transformers==4.41.2
 accelerate==0.31.0
-bitsandbytes==0.43.1
 sentencepiece==0.2.0
+
+# Fix: T4 GPU ve Qwen-VL-Chat için eklenenler
+bitsandbytes>=0.43.1
+transformers_stream_generator
+triton
 
 # =============================================================================
 # 🆕 Vision-Language Model Dependencies (Feature 3)

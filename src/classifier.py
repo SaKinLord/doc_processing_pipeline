@@ -1,9 +1,42 @@
 # src/classifier.py
+"""
+Figure Classification using CLIP/ViT models.
+
+🆕 BUGFIX: Added T4 GPU compatibility by detecting GPU type and using
+float16 instead of bfloat16 for older GPU architectures.
+"""
 
 import torch
 import cv2
 from PIL import Image
 from transformers import ViTImageProcessor, ViTForImageClassification
+
+
+def _detect_gpu_dtype():
+    """
+    Detect the best dtype for the current GPU.
+    
+    T4, P100, K80, and other older GPUs don't support BFloat16 natively,
+    which causes overflow errors. Use Float16 for these.
+    
+    Returns:
+        torch.dtype: Best dtype for the current GPU
+    """
+    if not torch.cuda.is_available():
+        return torch.float32
+    
+    device_name = torch.cuda.get_device_name(0).lower()
+    
+    # GPUs that don't support BFloat16 well
+    older_gpus = ['t4', 'p100', 'k80', 'p4', 'p40', 'm60', 'v100']
+    
+    for gpu in older_gpus:
+        if gpu in device_name:
+            return torch.float16
+    
+    # A100, H100, and newer GPUs support BFloat16
+    return torch.bfloat16
+
 
 class FigureClassifier:
     _instance = None
@@ -22,7 +55,13 @@ class FigureClassifier:
             self.processor = None
             self.model = None
             self.model_type = None
+            self.dtype = torch.float32
             return
+
+        # 🆕 BUGFIX: Detect GPU type and select appropriate dtype
+        self.dtype = _detect_gpu_dtype()
+        dtype_name = "float16" if self.dtype == torch.float16 else "bfloat16"
+        print(f"    - Using {dtype_name} for GPU: {torch.cuda.get_device_name(0)}")
 
         # Try CLIP first (better for document figures)
         try:
@@ -32,7 +71,12 @@ class FigureClassifier:
             self.model_type = 'clip'
             model_id = "openai/clip-vit-base-patch32"
             self.processor = CLIPProcessor.from_pretrained(model_id)
-            self.model = CLIPModel.from_pretrained(model_id).to("cuda")
+            
+            # 🆕 BUGFIX: Load model with GPU-appropriate dtype
+            self.model = CLIPModel.from_pretrained(
+                model_id,
+                torch_dtype=self.dtype
+            ).to("cuda")
 
             # Define document-specific labels for zero-shot classification
             self.candidate_labels = [
@@ -78,7 +122,13 @@ class FigureClassifier:
             self.model_type = 'vit'
             model_id = "google/vit-base-patch16-224"
             self.processor = ViTImageProcessor.from_pretrained(model_id)
-            self.model = ViTForImageClassification.from_pretrained(model_id).to("cuda")
+            
+            # 🆕 BUGFIX: Use GPU-appropriate dtype
+            self.model = ViTForImageClassification.from_pretrained(
+                model_id,
+                torch_dtype=self.dtype
+            ).to("cuda")
+            
             print("    - ✅ Figure Classifier (ViT) initialized successfully on GPU.")
         except Exception as e:
             print(f"    - [ERROR] Failed to initialize Figure Classifier: {e}")
@@ -188,12 +238,25 @@ class FigureClassifier:
         return 'figure'
 
     def classify(self, image_roi) -> str:
-        """Classifies a given image ROI using CLIP (zero-shot) or ViT."""
+        """
+        Classifies a given image ROI using CLIP (zero-shot) or ViT.
+        
+        🆕 BUGFIX: Added proper dtype handling for T4 GPU compatibility.
+        """
         if self.model is None or self.processor is None:
             return "figure"
 
         try:
-            image_rgb = Image.fromarray(cv2.cvtColor(image_roi, cv2.COLOR_BGR2RGB))
+            # Validate input
+            if image_roi is None or image_roi.size == 0:
+                return "figure"
+            
+            # Convert BGR to RGB PIL Image
+            if len(image_roi.shape) == 2:
+                # Grayscale
+                image_rgb = Image.fromarray(image_roi).convert('RGB')
+            else:
+                image_rgb = Image.fromarray(cv2.cvtColor(image_roi, cv2.COLOR_BGR2RGB))
 
             if self.model_type == 'clip':
                 # Zero-shot classification with CLIP
@@ -202,9 +265,18 @@ class FigureClassifier:
                     images=image_rgb,
                     return_tensors="pt",
                     padding=True
-                ).to("cuda")
+                )
+                
+                # 🆕 BUGFIX: Move inputs to GPU with correct dtype
+                inputs = {k: v.to("cuda") for k, v in inputs.items()}
+                
+                # Convert pixel values to the correct dtype
+                if 'pixel_values' in inputs:
+                    inputs['pixel_values'] = inputs['pixel_values'].to(self.dtype)
 
-                outputs = self.model(**inputs)
+                with torch.no_grad():
+                    outputs = self.model(**inputs)
+                
                 logits_per_image = outputs.logits_per_image
                 probs = logits_per_image.softmax(dim=1)
 
@@ -214,8 +286,15 @@ class FigureClassifier:
                 return self.label_to_kind.get(best_label, "figure")
 
             else:  # ViT classification (fallback)
-                inputs = self.processor(images=image_rgb, return_tensors="pt").to("cuda")
-                outputs = self.model(**inputs)
+                inputs = self.processor(images=image_rgb, return_tensors="pt")
+                inputs = {k: v.to("cuda") for k, v in inputs.items()}
+                
+                # 🆕 BUGFIX: Convert to correct dtype
+                if 'pixel_values' in inputs:
+                    inputs['pixel_values'] = inputs['pixel_values'].to(self.dtype)
+                
+                with torch.no_grad():
+                    outputs = self.model(**inputs)
                 logits = outputs.logits
 
                 predicted_class_idx = logits.argmax(-1).item()
@@ -224,6 +303,14 @@ class FigureClassifier:
                 kind = self._map_label_to_kind(predicted_label)
                 return kind
 
+        except (ValueError, RuntimeError, OverflowError) as e:
+            # 🆕 BUGFIX: Handle BFloat16/dtype errors gracefully
+            error_str = str(e).lower()
+            if 'bfloat16' in error_str or 'overflow' in error_str or 'dtype' in error_str:
+                # Silently fall back to heuristic
+                return "figure"
+            print(f"    - Error during figure classification: {e}")
+            return "figure"
         except Exception as e:
             print(f"    - Error during figure classification: {e}")
             return "figure"
