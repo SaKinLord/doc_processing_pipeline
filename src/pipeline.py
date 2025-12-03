@@ -19,6 +19,11 @@ Pipeline Flow:
 - Added language pack availability check
 - Added confidence threshold for non-English detection
 - Added deterministic seeding for langdetect
+
+🆕 v2.4 COORDINATE FIX:
+- Fixed bounding box coordinate misalignment when Super-Resolution is enabled
+- All output coordinates now map to ORIGINAL image dimensions
+- Added coordinate transformation to preserve compatibility with original input files
 """
 
 import os
@@ -178,6 +183,11 @@ class DocumentProcessor:
     🆕 v2.1 Architecture:
     - Surya handles LAYOUT DETECTION (finding text regions)
     - Tesseract/TrOCR handles TEXT RECOGNITION (reading text)
+    
+    🆕 v2.4 Coordinate Fix:
+    - Stores original image dimensions separately from working dimensions
+    - Tracks super-resolution scale factor
+    - Transforms all coordinates back to original space before output
     """
     
     def __init__(self, file_path=None, image_object=None, file_name=None, page_num=1, language_override=None):
@@ -206,6 +216,11 @@ class DocumentProcessor:
         self.width = 0
         self.detected_lang_tess = config.DEFAULT_OCR_LANG
         self.quality_metrics = None
+
+        # 🆕 v2.4 FIX: Store original dimensions and scale factor for coordinate mapping
+        self.original_width = 0
+        self.original_height = 0
+        self.sr_scale_factor = 1.0  # 1.0 means no scaling applied
 
         # Output data
         self.elements = []
@@ -244,6 +259,11 @@ class DocumentProcessor:
             raise ValueError(f"Failed to load image: {self.file_name}")
         
         self.height, self.width = self.bgr_image.shape[:2]
+        
+        # 🆕 v2.4 FIX: Store original dimensions BEFORE any transformations
+        self.original_height = self.height
+        self.original_width = self.width
+        
         print(f"    - Image size: {self.width} x {self.height}")
 
     def _analyze_and_enhance_image(self):
@@ -284,9 +304,20 @@ class DocumentProcessor:
                 new_h, new_w = self.bgr_image_enhanced.shape[:2]
                 if new_h != self.height or new_w != self.width:
                     print(f"    - Image enhanced: {self.width}x{self.height} → {new_w}x{new_h}")
+                    
+                    # 🆕 v2.4 FIX: Calculate and store the actual scale factor
+                    # Use the average of width and height scale factors for robustness
+                    scale_w = new_w / self.original_width
+                    scale_h = new_h / self.original_height
+                    self.sr_scale_factor = (scale_w + scale_h) / 2.0
+                    
+                    print(f"    - 📐 Scale factor recorded: {self.sr_scale_factor:.2f}x (for coordinate mapping)")
+                    
+                    # Update working dimensions (used for processing)
                     self.height, self.width = new_h, new_w
         else:
             self.bgr_image_enhanced = self.bgr_image
+            self.sr_scale_factor = 1.0  # No scaling
             if quality_preset == 'clean':
                 print("    - ✅ Image quality is clean, skipping super-resolution.")
             elif self.width > 2000 or self.height > 2000:
@@ -296,6 +327,8 @@ class DocumentProcessor:
         
         self.metadata['image_quality'] = self.quality_metrics
         self.metadata['super_resolution_applied'] = should_enhance
+        # 🆕 v2.4 FIX: Store scale factor in metadata for transparency
+        self.metadata['sr_scale_factor'] = self.sr_scale_factor
 
     def _preprocess_image(self):
         """Preprocess image for OCR."""
@@ -765,6 +798,73 @@ class DocumentProcessor:
         except Exception as e:
             print(f"    - Field extraction error: {e}")
 
+    # =========================================================================
+    # 🆕 v2.4 FIX: COORDINATE TRANSFORMATION METHODS
+    # =========================================================================
+    
+    def _transform_bbox_to_original(self, bbox: List[float]) -> List[float]:
+        """
+        Transform a bounding box from enhanced/working coordinates to original image coordinates.
+        
+        Args:
+            bbox: [x1, y1, x2, y2] in enhanced image space
+            
+        Returns:
+            [x1, y1, x2, y2] in original image space
+        """
+        if self.sr_scale_factor == 1.0:
+            return bbox  # No transformation needed
+        
+        # Divide coordinates by scale factor to map back to original space
+        return [
+            bbox[0] / self.sr_scale_factor,
+            bbox[1] / self.sr_scale_factor,
+            bbox[2] / self.sr_scale_factor,
+            bbox[3] / self.sr_scale_factor
+        ]
+    
+    def _transform_all_coordinates_to_original(self):
+        """
+        🆕 v2.4 FIX: Transform ALL bounding box coordinates in elements and metadata
+        back to original image space.
+        
+        This ensures output coordinates match the original input file dimensions,
+        regardless of any internal upscaling performed during processing.
+        """
+        if self.sr_scale_factor == 1.0:
+            print("    - 📐 No coordinate transformation needed (scale factor = 1.0)")
+            return
+        
+        print(f"    - 📐 Transforming coordinates from {self.sr_scale_factor:.2f}x enhanced space to original space...")
+        
+        transformed_count = 0
+        
+        # Transform element bounding boxes
+        for element in self.elements:
+            # Transform main bounding_box
+            if 'bounding_box' in element:
+                element['bounding_box'] = self._transform_bbox_to_original(element['bounding_box'])
+                transformed_count += 1
+            
+            # Transform table cell bboxes
+            if element.get('type') == 'Table' and 'cells' in element:
+                for cell in element['cells']:
+                    if 'bbox' in cell:
+                        cell['bbox'] = self._transform_bbox_to_original(cell['bbox'])
+                        transformed_count += 1
+        
+        # Transform field bboxes in metadata
+        if 'fields' in self.metadata:
+            for field_name, field_data in self.metadata['fields'].items():
+                if 'label_bbox' in field_data:
+                    field_data['label_bbox'] = self._transform_bbox_to_original(field_data['label_bbox'])
+                    transformed_count += 1
+                if 'value_bbox' in field_data:
+                    field_data['value_bbox'] = self._transform_bbox_to_original(field_data['value_bbox'])
+                    transformed_count += 1
+        
+        print(f"    - ✅ Transformed {transformed_count} bounding boxes to original coordinates")
+
     def run(self) -> Dict:
         """Run the complete document processing pipeline."""
         print(f"\n{'='*60}")
@@ -784,10 +884,15 @@ class DocumentProcessor:
             self._extract_figures()
             self._extract_fields()
             
+            # 🆕 v2.4 FIX: Transform all coordinates back to original image space
+            # BEFORE building the result dictionary
+            self._transform_all_coordinates_to_original()
+            
+            # 🆕 v2.4 FIX: Use ORIGINAL dimensions in output, not enhanced dimensions
             result = {
                 "page": self.page_num,
-                "page_width": self.width,
-                "page_height": self.height,
+                "page_width": self.original_width,   # 🔧 FIX: Use original, not self.width
+                "page_height": self.original_height, # 🔧 FIX: Use original, not self.height
                 "elements": self.elements,
                 "metadata": self.metadata
             }
@@ -795,6 +900,7 @@ class DocumentProcessor:
             result = add_quality_flags(result)
             
             print(f"\n✅ Processing complete: {len(self.elements)} elements extracted.")
+            print(f"   📐 Output coordinates mapped to original dimensions: {self.original_width}x{self.original_height}")
             
             return result
             
