@@ -24,6 +24,12 @@ Pipeline Flow:
 - Fixed bounding box coordinate misalignment when Super-Resolution is enabled
 - All output coordinates now map to ORIGINAL image dimensions
 - Added coordinate transformation to preserve compatibility with original input files
+
+🆕 v2.5 OCR & VLM FIXES:
+- PaddleOCR is now the PRIMARY OCR engine (superior for noisy fax documents)
+- Tesseract is used as fallback only when PaddleOCR fails or returns poor results
+- VLM_CONFIDENCE_THRESHOLD raised to 65.0 so VLM actually gets used
+- VLM_USE_4BIT enabled by default to prevent OOM on 16GB VRAM GPUs
 """
 
 import os
@@ -620,9 +626,20 @@ class DocumentProcessor:
         bbox: List[float],
         detection_source: str = 'unknown'
     ) -> Tuple[str, float]:
-        """Recognition-only OCR for a detected region."""
+        """
+        Recognition-only OCR for a detected region.
+        
+        🆕 v2.5 FIX: PaddleOCR is now the PRIMARY engine (better for noisy faxes).
+        Tesseract is used as fallback when PaddleOCR fails or returns poor results.
+        
+        OCR Priority Order:
+        1. Handwritten regions → TrOCR → PaddleOCR → Tesseract
+        2. Printed regions → PaddleOCR (primary) → Tesseract (fallback)
+        3. Low confidence → VLM correction (if enabled)
+        """
         sr_already_applied = self.metadata.get('super_resolution_applied', False)
         
+        # Step 1: Detect if handwritten
         try:
             from .handwriting_detector import get_handwriting_detector
             detector = get_handwriting_detector()
@@ -633,6 +650,7 @@ class DocumentProcessor:
             text_type = 'unknown'
             hw_confidence = 0.0
         
+        # Step 2: Route handwritten text to specialized engines
         if text_type == 'handwritten' and hw_confidence > 0.5:
             print(f"      - Region classified as handwritten (conf: {hw_confidence:.2f})")
             
@@ -642,38 +660,109 @@ class DocumentProcessor:
                 full_image_sr_applied=sr_already_applied
             )
             
+            # Try TrOCR first for handwriting
             text = ocr.ocr_with_trocr(hw_roi)
             if text and len(text.strip()) > 0:
                 return text, 85.0
             
+            # Fallback to PaddleOCR for handwriting
             text = ocr.ocr_with_paddle(hw_roi)
             if text and len(text.strip()) > 0:
                 return text, 75.0
+            
+            # Last resort: Tesseract
+            text, conf = ocr.ocr_with_tesseract(roi_binary, lang=self.detected_lang_tess, box=bbox)
+            return text, conf
         
-        text, conf = ocr.ocr_with_tesseract(roi_binary, lang=self.detected_lang_tess, box=bbox)
+        # =========================================================================
+        # 🆕 v2.5 FIX: PaddleOCR as PRIMARY engine for printed text
+        # =========================================================================
+        use_paddle_primary = getattr(config, 'USE_PADDLE_AS_PRIMARY', True)
+        paddle_min_conf = getattr(config, 'PADDLE_MIN_CONFIDENCE', 30.0)
         
-        if conf < 50:
+        best_text = ""
+        best_conf = 0.0
+        
+        if use_paddle_primary:
+            # Try PaddleOCR FIRST (superior for noisy fax documents)
             paddle_text = ocr.ocr_with_paddle(roi_bgr)
-            if paddle_text:
+            if paddle_text and len(paddle_text.strip()) > 0:
                 paddle_quality = ocr._calculate_text_quality_score(paddle_text, 75.0)
-                tess_quality = ocr._calculate_text_quality_score(text, conf)
                 
-                if paddle_quality > tess_quality + 10:
-                    return paddle_text, 75.0
+                if paddle_quality >= paddle_min_conf:
+                    best_text = paddle_text
+                    best_conf = 75.0
+                    # If PaddleOCR gives good results, use them
+                    if paddle_quality >= getattr(config, 'TESSERACT_QUALITY_THRESHOLD', 65.0):
+                        # Good enough - skip Tesseract entirely
+                        pass
+                    else:
+                        # Moderate quality - also try Tesseract and compare
+                        tess_text, tess_conf = ocr.ocr_with_tesseract(
+                            roi_binary, lang=self.detected_lang_tess, box=bbox
+                        )
+                        tess_quality = ocr._calculate_text_quality_score(tess_text, tess_conf)
+                        
+                        # Use Tesseract only if significantly better
+                        if tess_quality > paddle_quality + 15:
+                            best_text = tess_text
+                            best_conf = tess_conf
+                else:
+                    # PaddleOCR gave poor results - try Tesseract
+                    tess_text, tess_conf = ocr.ocr_with_tesseract(
+                        roi_binary, lang=self.detected_lang_tess, box=bbox
+                    )
+                    tess_quality = ocr._calculate_text_quality_score(tess_text, tess_conf)
+                    
+                    # Use whichever is better
+                    if tess_quality > paddle_quality:
+                        best_text = tess_text
+                        best_conf = tess_conf
+                    else:
+                        best_text = paddle_text
+                        best_conf = 75.0
+            else:
+                # PaddleOCR returned nothing - use Tesseract
+                best_text, best_conf = ocr.ocr_with_tesseract(
+                    roi_binary, lang=self.detected_lang_tess, box=bbox
+                )
+        else:
+            # Legacy behavior: Tesseract first (if USE_PADDLE_AS_PRIMARY=False)
+            best_text, best_conf = ocr.ocr_with_tesseract(
+                roi_binary, lang=self.detected_lang_tess, box=bbox
+            )
+            
+            # Try PaddleOCR as fallback for low confidence
+            if best_conf < 50:
+                paddle_text = ocr.ocr_with_paddle(roi_bgr)
+                if paddle_text:
+                    paddle_quality = ocr._calculate_text_quality_score(paddle_text, 75.0)
+                    tess_quality = ocr._calculate_text_quality_score(best_text, best_conf)
+                    
+                    if paddle_quality > tess_quality + 10:
+                        best_text = paddle_text
+                        best_conf = 75.0
         
-        if conf < getattr(config, 'VLM_CONFIDENCE_THRESHOLD', 50.0) and VLM_AVAILABLE:
+        # =========================================================================
+        # Step 3: VLM correction for moderate-to-low confidence results
+        # 🆕 v2.5 FIX: Threshold raised to 65.0 so VLM actually gets used
+        # =========================================================================
+        vlm_threshold = getattr(config, 'VLM_CONFIDENCE_THRESHOLD', 65.0)
+        
+        if best_conf < vlm_threshold and VLM_AVAILABLE:
             if getattr(config, 'USE_VLM', False):
                 try:
                     vlm = vlm_manager.get_vlm_manager()
-                    if vlm.is_available:
-                        confirmed_text = vlm.confirm_ocr_text(roi_bgr, text, "text region")
-                        if confirmed_text and confirmed_text != text:
-                            print(f"      - VLM corrected: '{text[:30]}...' → '{confirmed_text[:30]}...'")
+                    if vlm and vlm.is_available:
+                        confirmed_text = vlm.confirm_ocr_text(roi_bgr, best_text, "text region")
+                        if confirmed_text and confirmed_text != best_text:
+                            print(f"      - VLM corrected: '{best_text[:30]}...' → '{confirmed_text[:30]}...'")
                             return confirmed_text, 70.0
-                except:
+                except Exception as e:
+                    # VLM failed - continue with OCR result
                     pass
         
-        return text, conf
+        return best_text, best_conf
 
     def _extract_tables(self):
         """Extract tables from the document."""

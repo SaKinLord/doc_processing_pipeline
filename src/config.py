@@ -1,5 +1,6 @@
 # src/config.py
 # 🆕 OPTIMIZED VERSION for T4 GPU - Reduces processing time by ~50%
+# 🔧 v2.5 PATCH: Fixed OCR priority and VLM OOM issues
 
 import os
 from pathlib import Path
@@ -59,6 +60,18 @@ LOW_CONFIDENCE_THRESHOLD = 70.0
 LANG_DETECT_CONFIDENCE_THRESHOLD = 0.98
 
 # =============================================================================
+#  🆕 v2.5 FIX: OCR ENGINE PRIORITY SETTINGS
+# =============================================================================
+# PaddleOCR is superior for noisy fax documents - make it primary
+USE_PADDLE_AS_PRIMARY = True
+
+# Minimum confidence for PaddleOCR to be accepted (before falling back to Tesseract)
+PADDLE_MIN_CONFIDENCE = 30.0
+
+# Quality score threshold for accepting Tesseract results without trying alternatives
+TESSERACT_QUALITY_THRESHOLD = 65.0
+
+# =============================================================================
 #  🆕 SURYA OCR SETTINGS
 # =============================================================================
 USE_SURYA_OCR = True
@@ -68,20 +81,22 @@ SURYA_LINE_DETECTION_ONLY = True
 SURYA_CONFIDENCE_THRESHOLD = 0.6
 
 # =============================================================================
-#  🆕 VISION-LANGUAGE MODEL (VLM) SETTINGS (OPTIMIZED)
+#  🆕 v2.5 FIX: VISION-LANGUAGE MODEL (VLM) SETTINGS (16GB VRAM SAFE)
 # =============================================================================
-# CHANGE: Disabled by default for faster processing
-# VLM adds ~30-60 seconds per page on T4
-# Enable if form field extraction is critical
+# VLM is enabled but with 4-bit quantization to fit in 16GB VRAM
 USE_VLM = True
 
 VLM_MODEL = 'qwen-vl-chat'
 
-# CHANGE: Use float16 compute dtype for T4 compatibility
-# Even if VLM is enabled, this prevents bfloat16 errors
-VLM_USE_4BIT = False  # Disabled because triton/bitsandbytes has issues on T4
+# 🔧 v2.5 FIX: FORCE 4-bit quantization to prevent OOM on 16GB VRAM
+# Qwen-VL-Chat in float16 needs ~19GB VRAM, but 4-bit only needs ~6GB
+VLM_USE_4BIT = True  # 🔧 CHANGED from False - CRITICAL for 16GB VRAM!
 
-VLM_CONFIDENCE_THRESHOLD = 40.0  # Only use VLM for very low confidence OCR
+# 🔧 v2.5 FIX: Raised threshold so VLM actually gets used
+# OLD: 40.0 (VLM only triggered for extremely bad OCR, rarely used)
+# NEW: 65.0 (VLM will help correct moderate-confidence OCR errors)
+VLM_CONFIDENCE_THRESHOLD = 65.0  # 🔧 CHANGED from 40.0
+
 VLM_MAX_TOKENS = 256
 VLM_TEMPERATURE = 0.1
 
@@ -148,6 +163,8 @@ def get_feature_status():
         'super_resolution': USE_SUPER_RESOLUTION,
         'surya_ocr': USE_SURYA_OCR,
         'vlm_confirmation': USE_VLM,
+        'vlm_4bit_quantization': VLM_USE_4BIT,
+        'paddle_primary': USE_PADDLE_AS_PRIMARY,
         'fuzzy_matching': USE_FUZZY_MATCHING,
         'ocr_routing': USE_OCR_ROUTING,
         'text_postprocessing': ENABLE_TEXT_POSTPROCESSING,
@@ -165,6 +182,12 @@ def print_feature_status():
         icon = "✅" if enabled else "❌"
         print(f"  {icon} {feature.replace('_', ' ').title()}: {'Enabled' if enabled else 'Disabled'}")
     print("-" * 40)
+    
+    # 🆕 v2.5: Print VLM memory warning if not using 4-bit
+    if USE_VLM and not VLM_USE_4BIT:
+        print("  ⚠️  WARNING: VLM 4-bit quantization is OFF!")
+        print("  ⚠️  This requires ~19GB VRAM. Enable VLM_USE_4BIT for 16GB GPUs.")
+    print()
 
 
 # =============================================================================
